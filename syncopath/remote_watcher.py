@@ -4,14 +4,17 @@ import threading
 import time
 from typing import Callable, Optional
 
-from .drive_api import DriveAPI, GOOGLE_NATIVE_MIMES, GOOGLE_EXPORT_MAP
+from .drive_api import DriveAPI
 from .state import StateDB
 
 log = logging.getLogger(__name__)
 
-# Maximum consecutive failures before poll interval backs off to POLL_FAILURE_CAP seconds
-_FAILURE_BACKOFF = [30, 60, 120, 300]   # per-failure delays before next retry
-_POLL_FAILURE_CAP = 300                  # 5 minutes — maximum inter-poll delay on errors
+# Delay (seconds) before each retry after consecutive poll failures.
+# Index 0 = after 1st failure, index -1 = cap for all subsequent failures.
+_FAILURE_BACKOFF = [30, 60, 120, 300]
+
+# How often the watchdog checks whether the poll thread is still alive (seconds).
+_WATCHDOG_CHECK_INTERVAL = 15
 
 
 class RemoteChange:
@@ -41,10 +44,12 @@ class RemoteWatcher:
       _POLL_FAILURE_CAP seconds instead of hammering the API on auth failures.
     """
 
-    def __init__(self, drive: DriveAPI, state_db: StateDB, poll_interval: float = 30.0):
+    def __init__(self, drive: DriveAPI, state_db: StateDB, poll_interval: float = 30.0,
+                 watchdog_check_interval: float = _WATCHDOG_CHECK_INTERVAL):
         self.drive = drive
         self.state_db = state_db
         self.poll_interval = poll_interval
+        self._watchdog_check_interval = watchdog_check_interval
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -95,7 +100,12 @@ class RemoteWatcher:
         self._wake_event.set()
 
     def poll_once(self) -> list[RemoteChange]:
-        """Run a single poll cycle. Returns list of changes."""
+        """Run a single poll cycle. Returns list of changes.
+
+        Note: this method does not update the consecutive-failure counter used
+        for backoff — it is intended for external callers (e.g. tests) that need
+        a synchronous poll. The internal poll loop uses _poll_with_tracking().
+        """
         token = self.state_db.get_page_token()
         if not token:
             token = self.drive.get_start_page_token()
@@ -107,7 +117,14 @@ class RemoteWatcher:
             return []
 
         self.state_db.set_page_token(new_token)
+        return self._parse_changes(raw_changes)
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _parse_changes(self, raw_changes: list[dict]) -> list[RemoteChange]:
+        """Convert raw Drive API change dicts into RemoteChange objects."""
         changes = []
         for change in raw_changes:
             file_id = change["fileId"]
@@ -117,7 +134,6 @@ class RemoteWatcher:
             if removed or (file_meta and file_meta.get("trashed")):
                 changes.append(RemoteChange(file_id, "deleted", file_meta))
             elif file_meta:
-                # Determine if it's new or modified
                 existing = self.state_db.get_by_file_id(file_id)
                 if existing:
                     changes.append(RemoteChange(file_id, "modified", file_meta))
@@ -130,10 +146,6 @@ class RemoteWatcher:
                 log.debug("  %s", c)
 
         return changes
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _start_poll_thread(self):
         """Spawn (or re-spawn) the poll loop thread."""
@@ -158,9 +170,11 @@ class RemoteWatcher:
                     break
                 thread = self._thread
 
-            # Wait for the thread to finish (or check periodically)
+            # Check periodically with a fixed short interval rather than joining
+            # with a long timeout — this bounds restart latency regardless of
+            # the configured poll_interval.
             if thread is not None:
-                thread.join(timeout=self.poll_interval * 3)
+                thread.join(timeout=self._watchdog_check_interval)
 
             with self._lock:
                 if not self._running:
@@ -207,10 +221,8 @@ class RemoteWatcher:
         log.debug("Poll loop exited")
 
     def _poll_with_tracking(self) -> list[RemoteChange]:
-        """Call poll_once() and track consecutive failures for backoff."""
+        """Poll for changes and track consecutive failures for backoff."""
         try:
-            # We need to distinguish success from failure, but poll_once() swallows
-            # exceptions and returns []. Re-implement the error path here with tracking.
             token = self.state_db.get_page_token()
             if not token:
                 token = self.drive.get_start_page_token()
@@ -223,27 +235,7 @@ class RemoteWatcher:
                          self._consecutive_failures)
             self._consecutive_failures = 0
 
-            changes = []
-            for change in raw_changes:
-                file_id = change["fileId"]
-                removed = change.get("removed", False)
-                file_meta = change.get("file")
-
-                if removed or (file_meta and file_meta.get("trashed")):
-                    changes.append(RemoteChange(file_id, "deleted", file_meta))
-                elif file_meta:
-                    existing = self.state_db.get_by_file_id(file_id)
-                    if existing:
-                        changes.append(RemoteChange(file_id, "modified", file_meta))
-                    else:
-                        changes.append(RemoteChange(file_id, "created", file_meta))
-
-            if changes:
-                log.info("Remote poll: %d change(s) detected", len(changes))
-                for c in changes:
-                    log.debug("  %s", c)
-
-            return changes
+            return self._parse_changes(raw_changes)
 
         except Exception as e:
             self._consecutive_failures += 1
