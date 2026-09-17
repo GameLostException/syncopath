@@ -1,0 +1,16 @@
+[Unit]
+Description=SyncoPath — Google Drive Sync Daemon
+Documentation=https://github.com/boris/syncopath
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Lab/syncopath/.venv/bin/python -m syncopath
+Restart=on-failure
+RestartSec=10
+Environment=DISPLAY=:0.0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=graphical-session.target

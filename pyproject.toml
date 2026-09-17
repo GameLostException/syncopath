@@ -1,0 +1,23 @@
+[project]
+name = "syncopath"
+version = "0.1.0"
+description = "The obsessive Google Drive syncer for Linux that never sleeps 🔪📁"
+requires-python = ">=3.11"
+dependencies = [
+    "google-api-python-client==2.166.0",
+    "google-auth-oauthlib==1.2.1",
+    "google-auth==2.40.3",
+    "watchdog==6.0.0",
+    "PyGObject==3.52.3",
+    "pyyaml==6.0.2",
+]
+
+[project.scripts]
+syncopath = "syncopath.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["syncopath*"]

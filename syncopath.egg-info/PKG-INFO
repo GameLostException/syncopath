@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: syncopath
+Version: 0.1.0
+Summary: The obsessive Google Drive syncer for Linux that never sleeps 🔪📁
+Requires-Python: >=3.11
+Requires-Dist: google-api-python-client==2.166.0
+Requires-Dist: google-auth-oauthlib==1.2.1
+Requires-Dist: google-auth==2.40.3
+Requires-Dist: watchdog==6.0.0
+Requires-Dist: PyGObject==3.52.3
+Requires-Dist: pyyaml==6.0.2
