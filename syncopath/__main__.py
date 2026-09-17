@@ -242,14 +242,14 @@ class SyncoPathDaemon:
         """Force an immediate sync cycle."""
         for acc in self.accounts:
             worker = acc.get("worker")
-            if worker:
-                # Poll for remote changes and enqueue them
-                changes = acc["remote_watcher"].poll_once()
-                if changes:
-                    worker.enqueue_remote(changes)
-                else:
-                    # No pending changes — run reconcile
-                    worker.enqueue_reconcile()
+            remote_watcher = acc.get("remote_watcher")
+            if worker and remote_watcher:
+                # Wake the poll loop immediately rather than calling poll_once()
+                # directly — this avoids a double-poll race and lets the watcher's
+                # own backoff/failure-tracking logic run as normal.
+                remote_watcher.trigger_poll()
+                # Also enqueue a reconcile to catch any local drift.
+                worker.enqueue_reconcile()
 
     def _open_folder(self):
         """Open the first account's sync folder."""
