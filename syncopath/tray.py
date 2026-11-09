@@ -94,6 +94,8 @@ class TrayIcon:
         self._on_sync_now: Optional[Callable] = None
         self._on_quit: Optional[Callable] = None
         self._on_open_folder: Optional[Callable] = None
+        self._on_pending_deletions: Optional[Callable] = None
+        self._on_drive_deletions: Optional[Callable] = None
         self._indicator = None
         self._status_icon = None
         self._menu = None
@@ -127,6 +129,8 @@ class TrayIcon:
         on_quit: Callable = None,
         on_open_folder: Callable = None,
         on_preferences: Callable = None,
+        on_pending_deletions: Callable = None,
+        on_drive_deletions: Callable = None,
     ):
         self._on_pause = on_pause
         self._on_resume = on_resume
@@ -134,6 +138,8 @@ class TrayIcon:
         self._on_quit = on_quit
         self._on_open_folder = on_open_folder
         self._on_preferences = on_preferences
+        self._on_pending_deletions = on_pending_deletions
+        self._on_drive_deletions = on_drive_deletions
 
     def start(self):
         """Initialize the tray icon (must be called from main thread)."""
@@ -163,6 +169,22 @@ class TrayIcon:
     def update_status(self, status: str, detail: str = ""):
         """Update tray icon status. Thread-safe."""
         GLib.idle_add(self._do_update_status, status, detail)
+
+    def update_deletions(self, pending_local: int, deleted_on_drive: int):
+        """Show or hide the two deletion menu items with their counts (thread-safe)."""
+        GLib.idle_add(self._do_update_deletions, pending_local, deleted_on_drive)
+
+    def _do_update_deletions(self, pending_local: int, deleted_on_drive: int):
+        if self._menu is None:
+            return False
+        for item, count, label in (
+                (self._pending_deletions_item, pending_local, "Pending deletions ({})…"),
+                (self._drive_deletions_item, deleted_on_drive,
+                 "Delete files removed from Drive ({})…")):
+            item.set_label(label.format(count))
+            item.set_visible(count > 0)
+        self._deletions_separator.set_visible(pending_local > 0 or deleted_on_drive > 0)
+        return False
 
     def update_progress(self, current: int, total: int, current_file: str = "",
                         file_size: int = 0):
@@ -380,6 +402,18 @@ class TrayIcon:
 
         self._menu.append(Gtk.SeparatorMenuItem())
 
+        # Deletions waiting for the user (safe mode) — hidden while there are none
+        self._pending_deletions_item = Gtk.MenuItem(label="Pending deletions…")
+        self._pending_deletions_item.connect(
+            "activate", lambda _: self._on_pending_deletions and self._on_pending_deletions())
+        self._menu.append(self._pending_deletions_item)
+        self._drive_deletions_item = Gtk.MenuItem(label="Delete files removed from Drive…")
+        self._drive_deletions_item.connect(
+            "activate", lambda _: self._on_drive_deletions and self._on_drive_deletions())
+        self._menu.append(self._drive_deletions_item)
+        self._deletions_separator = Gtk.SeparatorMenuItem()
+        self._menu.append(self._deletions_separator)
+
         # Pause/Resume
         self._pause_item = Gtk.MenuItem(label="Pause")
         self._pause_item.connect("activate", self._toggle_pause)
@@ -400,9 +434,10 @@ class TrayIcon:
         self._menu.append(item)
 
         self._menu.show_all()
-        # Hide progress elements initially
+        # Hide progress and deletion elements initially
         self._progress_item.hide()
         self._file_label.hide()
+        self._do_update_deletions(0, 0)
 
     def _toggle_pause(self, _widget):
         """Toggle pause/resume."""

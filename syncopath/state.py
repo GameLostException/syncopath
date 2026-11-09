@@ -181,6 +181,36 @@ class StateDB:
             log.debug("Renamed %d children from '%s/' to '%s/'",
                       len(rows), old_prefix, new_prefix)
 
+    # A row and everything below it: the path itself or "path/..."
+    _TREE = "(path = ? OR substr(path, 1, length(?) + 1) = ? || '/')"
+
+    @_locked
+    def get_tree(self, path: str) -> list[FileState]:
+        """The row at `path` and every row below it (a folder's whole subtree)."""
+        rows = self._conn.execute(
+            f"SELECT * FROM files WHERE {self._TREE} ORDER BY path", (path, path, path)
+        ).fetchall()
+        return [self._row_to_state(r) for r in rows]
+
+    @_locked
+    def set_sync_status_tree(self, path: str, status: str):
+        self._conn.execute(
+            f"UPDATE files SET sync_status = ? WHERE {self._TREE}", (status, path, path, path)
+        )
+        self._conn.commit()
+
+    @_locked
+    def delete_tree(self, path: str):
+        self._conn.execute(f"DELETE FROM files WHERE {self._TREE}", (path, path, path))
+        self._conn.commit()
+
+    @_locked
+    def get_by_status(self, status: str) -> list[FileState]:
+        rows = self._conn.execute(
+            "SELECT * FROM files WHERE sync_status = ? ORDER BY path", (status,)
+        ).fetchall()
+        return [self._row_to_state(r) for r in rows]
+
     @_locked
     def set_sync_status(self, path: str, status: str):
         """Update sync_status for a file."""

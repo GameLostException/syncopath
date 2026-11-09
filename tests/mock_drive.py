@@ -11,6 +11,15 @@ from typing import Optional
 from dataclasses import dataclass, field
 
 
+class MockHttpError(Exception):
+    """Shaped like googleapiclient's HttpError: .resp.status and a reason."""
+
+    def __init__(self, status: int, reason: str):
+        super().__init__(f"<HttpError {status}: {reason}>")
+        self.resp = type("Resp", (), {"status": status})()
+        self.error_details = [{"reason": reason}]
+
+
 @dataclass
 class MockDriveFile:
     """An in-memory Drive file/folder."""
@@ -183,7 +192,10 @@ class MockDriveAPI:
         return folder_id
 
     def delete_file(self, file_id: str):
-        """Trash a file."""
+        """Trash a file (Drive refuses for files owned by someone else)."""
+        f = self._files.get(file_id)
+        if f is not None and not f.owned_by_me:
+            raise MockHttpError(403, "insufficientFilePermissions")
         if file_id in self._files:
             self._files[file_id].trashed = True
             self._changes.append({
@@ -318,6 +330,20 @@ class MockDriveAPI:
             "removed": False,
             "file": self._file_to_meta(f),
         })
+
+    def simulate_remote_trash(self, file_id: str):
+        """Simulate someone moving a file to Drive's bin (a 'trashed' change)."""
+        f = self._files[file_id]
+        f.trashed = True
+        self._changes.append({"fileId": file_id, "removed": False,
+                              "file": self._file_to_meta(f)})
+
+    def simulate_remote_untrash(self, file_id: str):
+        """Simulate restoring a file from Drive's bin."""
+        f = self._files[file_id]
+        f.trashed = False
+        self._changes.append({"fileId": file_id, "removed": False,
+                              "file": self._file_to_meta(f)})
 
     def simulate_remote_delete(self, file_id: str):
         """Simulate a remote deletion."""

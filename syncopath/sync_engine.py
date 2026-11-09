@@ -7,18 +7,37 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from .config import AccountConfig, CONFIG_DIR
 from .drive_api import (DriveAPI, GOOGLE_NATIVE_MIMES, GOOGLE_EXPORT_MAP, GOOGLE_SKIP_MIMES,
-                        is_auth_error, is_not_found, is_skip_mime, is_transient,
+                        http_status, is_auth_error, is_not_found, is_skip_mime, is_transient,
                         sanitize_filename)
 from .state import StateDB, FileState
 from .local_watcher import LocalChangeEvent
 from .remote_watcher import RemoteChange
 from .sync_worker import SyncBatchError
+from .trash import move_to_trash
 
 log = logging.getLogger(__name__)
+
+# Deletion states (docs/specs/deletion.md)
+PENDING_DELETE = "pending_delete"      # deleted here in safe mode, waiting to be sent to Drive
+DELETED_ON_DRIVE = "deleted_on_drive"  # in Drive's bin, kept here until the user deletes it
+SHARED_WITH_ME = "Shared with me"      # local folder of files owned by others
+
+
+class PendingDeletion(NamedTuple):
+    path: str
+    is_folder: bool
+    owned: bool  # False: deleting it only stops syncing it; Drive is not changed
+
+
+def _top_level(paths: list[str]) -> list[str]:
+    """Drop every path that sits inside another path of the list."""
+    chosen = set(paths)
+    return sorted(p for p in paths
+                  if not any(p.startswith(other + "/") for other in chosen if other != p))
 
 
 def md5_file(path: Path) -> Optional[str]:
@@ -41,6 +60,9 @@ def iso_to_timestamp(iso_str: str) -> float:
 class SyncEngine:
     """Bidirectional sync engine for one account."""
 
+    # Where local deletions go; replaced in tests so the real trash is never touched
+    _trash_local = staticmethod(move_to_trash)
+
     def __init__(self, config: AccountConfig, drive: DriveAPI, state_db: StateDB, safe_mode: bool = True,
                  min_free_space_gb: int = 5):
         self.config = config
@@ -59,6 +81,8 @@ class SyncEngine:
         self._progress_callback = None
         # Thunar overlay integration
         self._overlay = None
+        # Called when the lists of pending deletions may have changed
+        self._deletions_callback = None
 
     def set_watcher_suppress(self, suppress_fn, unsuppress_fn):
         """Set functions to suppress/unsuppress local watcher events."""
@@ -86,6 +110,14 @@ class SyncEngine:
     def set_progress_callback(self, callback):
         """Set callback for progress updates: callback(current, total, filename)."""
         self._progress_callback = callback
+
+    def set_deletions_callback(self, callback):
+        """callback() is called whenever pending deletions may have changed."""
+        self._deletions_callback = callback
+
+    def _notify_deletions(self):
+        if self._deletions_callback:
+            self._deletions_callback()
 
     def set_overlay(self, overlay):
         """Set Thunar overlay integration."""
@@ -245,6 +277,9 @@ class SyncEngine:
         self._notify_status("syncing", "Reconciling...")
 
         try:
+            if self._sync_root_looks_unmounted():
+                return
+            self._reconcile_deletion_marks()
             all_states = self.state_db.get_all()
 
             # Phase 1: Fix unknown/error files
@@ -347,6 +382,12 @@ class SyncEngine:
                                 self.state_db.delete_by_path(state.path)
                                 continue
 
+                            if state.sync_status == "synced":
+                                # Synced before, gone now, no event seen: it was deleted
+                                # while we were not watching (spec AC-15)
+                                self._handle_local_deletion(state.path)
+                                continue
+
                             self._download_file(meta, state.path)
                         else:
                             # File trashed on remote — remove from state
@@ -366,6 +407,38 @@ class SyncEngine:
             log.error("Reconcile failed: %s", e)
         finally:
             self._notify_status("idle", "Reconcile complete")
+
+    def _sync_root_looks_unmounted(self) -> bool:
+        """A missing or empty sync folder while files are tracked: never treat that
+        as 'the user deleted everything' (spec AC-14)."""
+        tracked = any(not s.is_folder and s.sync_status != PENDING_DELETE
+                      for s in self.state_db.get_all())
+        if not tracked:
+            return False
+        if self.local_root.is_dir() and any(self.local_root.iterdir()):
+            return False
+        log.error("Sync folder %s is missing or empty — is the disk mounted? "
+                  "No deletion will be propagated.", self.local_root)
+        self._notify_status("error", f"Sync folder missing or empty: {self.local_root}")
+        return True
+
+    def _reconcile_deletion_marks(self):
+        """Clear marks the user undid without us seeing it (spec AC-11)."""
+        for state in self.state_db.get_by_status(PENDING_DELETE):
+            if not state.is_folder and (self.local_root / state.path).exists():
+                self._restore_local(state.path)
+        for state in self.state_db.get_by_status(DELETED_ON_DRIVE):
+            try:
+                meta = self.drive.get_file_metadata(state.file_id)
+            except Exception as e:
+                log.debug("Reconcile: cannot check %s: %s", state.path, e)
+                continue
+            if not meta.get("trashed"):
+                log.info("Restored on Drive: %s", state.path)
+                self.state_db.set_sync_status(state.path, "synced")
+                if self._overlay and not state.is_folder:
+                    self._overlay.set_file_synced(state.path)
+        self._notify_deletions()
 
     def _get_remote_paths_cached(self) -> dict:
         """Get remote file paths, using cache if fresh (< 5 minutes).
@@ -645,7 +718,7 @@ class SyncEngine:
         if event.event_type == "created" or event.event_type == "modified":
             self._upload_local_file(event.path)
         elif event.event_type == "deleted":
-            self._delete_remote_file(event.path)
+            self._handle_local_deletion(event.path)
         elif event.event_type == "moved":
             self._handle_local_move(event.path, event.dest_path)
 
@@ -676,6 +749,11 @@ class SyncEngine:
             return
 
         local_hash = md5_file(local_path)
+
+        # Back after a local deletion that was never sent to Drive: sync it again
+        if state and state.sync_status == PENDING_DELETE:
+            self._restore_local(rel_path)
+            state.sync_status = "synced"
 
         # Skip if unchanged from last sync
         if state and local_hash == state.local_md5:
@@ -750,32 +828,202 @@ class SyncEngine:
                     self._overlay.set_file_error(rel_path)
                 raise
 
-    def _delete_remote_file(self, rel_path: str):
-        """Delete a file from Drive (trash it)."""
-        if self._safe_mode:
-            log.info("SAFE MODE: would delete remote %s — skipped", rel_path)
-            return
+    # ─── Deletions (docs/specs/deletion.md) ─────────────────────────────
 
+    def _initial_sync_done(self) -> bool:
+        """Deletions only propagate once the account has been fully synced (AC-10)."""
+        return self.state_db.get_page_token() is not None
+
+    @staticmethod
+    def _owned(rel_path: str) -> bool:
+        return not (rel_path == SHARED_WITH_ME or rel_path.startswith(SHARED_WITH_ME + "/"))
+
+    def _handle_local_deletion(self, rel_path: str):
+        """A synced file or folder disappeared locally."""
+        if not self._initial_sync_done():
+            return
         state = self.state_db.get_by_path(rel_path)
-        if not state:
+        if not state or state.sync_status == PENDING_DELETE:
             return
+        # No "unmounted?" check here: a live delete event is a real deletion (an
+        # unmount sends no delete events). Startup/reconcile check it (AC-14).
+        if self._safe_mode:
+            self.state_db.set_sync_status_tree(rel_path, PENDING_DELETE)
+            log.info("Deleted locally, waiting for confirmation: %s", rel_path)
+            self._notify_deletions()
+        else:
+            self._delete_on_drive(state)
 
-        # Only delete remotely if the file hasn't been modified on remote
+    def _forget(self, rel_path: str, reason: str):
+        log.info("%s: %s", reason, rel_path)
+        self.state_db.delete_tree(rel_path)
+
+    def _delete_on_drive(self, state: FileState):
+        """Move a locally deleted item to Drive's bin, unless that would lose something."""
+        rel_path = state.path
+        if not self._owned(rel_path):
+            self._forget(rel_path, "Not yours on Drive, stopped syncing")  # AC-19
+            return
         try:
-            remote_meta = self.drive.get_file_metadata(state.file_id)
-            if remote_meta.get("md5Checksum") != state.remote_md5:
-                log.warning("Remote file modified, skipping delete: %s", rel_path)
+            meta = self.drive.get_file_metadata(state.file_id)
+        except Exception as e:
+            if is_not_found(e):
+                self._forget(rel_path, "Already gone from Drive")
                 return
-        except Exception:
-            pass  # File might already be gone
-
+            raise
+        if meta.get("trashed"):
+            self._forget(rel_path, "Already in Drive's bin")
+            return
+        if not state.is_folder and self._changed_on_drive(state, meta):
+            # AC-16: the Drive version is newer than what was deleted — bring it back
+            log.warning("Changed on Drive since last sync, downloading instead of "
+                        "deleting: %s", rel_path)
+            self.state_db.set_sync_status_tree(rel_path, "synced")
+            self._download_file(meta, rel_path)
+            return
         try:
             self.drive.delete_file(state.file_id)
-            log.info("Trashed remote: %s", rel_path)
         except Exception as e:
-            log.warning("Failed to trash remote %s: %s", rel_path, e)
+            if http_status(e) == 403:  # someone else's file in your folder
+                self._forget(rel_path, "Drive refused the bin (not yours), stopped syncing")
+                return
+            raise
+        self._forget(rel_path, "Moved to Drive's bin")
 
-        self.state_db.delete_by_path(rel_path)
+    @staticmethod
+    def _changed_on_drive(state: FileState, meta: dict) -> bool:
+        if meta.get("md5Checksum") and state.remote_md5:
+            return meta["md5Checksum"] != state.remote_md5
+        return bool(state.remote_mtime) and meta.get("modifiedTime") != state.remote_mtime
+
+    def _restore_local(self, rel_path: str):
+        """The user put back something they had deleted: it is synced again (AC-11)."""
+        self.state_db.set_sync_status(rel_path, "synced")
+        parts = Path(rel_path).parts
+        for depth in range(1, len(parts)):
+            parent = self.state_db.get_by_path("/".join(parts[:depth]))
+            if parent and parent.sync_status == PENDING_DELETE:
+                self.state_db.set_sync_status(parent.path, "synced")
+        log.info("Restored locally, syncing again: %s", rel_path)
+        self._notify_deletions()
+
+    def pending_local_deletions(self) -> list[PendingDeletion]:
+        """Items deleted here in safe mode, not yet sent to Drive (folders listed once)."""
+        rows = {s.path: s for s in self.state_db.get_by_status(PENDING_DELETE)}
+        return [PendingDeletion(p, rows[p].is_folder, self._owned(p))
+                for p in _top_level(list(rows))]
+
+    def deleted_on_drive(self) -> list[str]:
+        """Items in Drive's bin that are still here (folders listed once)."""
+        return _top_level([s.path for s in self.state_db.get_by_status(DELETED_ON_DRIVE)])
+
+    def flush_local_deletions(self):
+        """Send every pending local deletion to Drive's bin (the user confirmed)."""
+        failed = []
+        for item in self.pending_local_deletions():
+            state = self.state_db.get_by_path(item.path)
+            if state is None:
+                continue
+            if (self.local_root / item.path).exists():
+                self._restore_local(item.path)
+                continue
+            try:
+                self._delete_on_drive(state)
+            except Exception as e:
+                log.error("Could not move %s to Drive's bin: %s", item.path, e)
+                failed.append(item.path)  # stays listed (spec UC-1 error flow)
+        self._notify_deletions()
+        if failed:
+            self._notify_status("error", f"{len(failed)} deletion(s) not sent to Drive")
+
+    # Drive → local
+
+    def _locally_edited(self, state: FileState) -> bool:
+        local_path = self.local_root / state.path
+        if state.local_md5 is not None:
+            return md5_file(local_path) != state.local_md5
+        return state.local_mtime > 0 and local_path.stat().st_mtime > state.local_mtime
+
+    def _split_for_drive_deletion(self, root_path: str):
+        """(rows still here, edited files among them) for a subtree deleted on Drive.
+        Rows of items no longer here are forgotten."""
+        present, edited = [], []
+        for row in self.state_db.get_tree(root_path):
+            if not (self.local_root / row.path).exists():
+                self.state_db.delete_by_path(row.path)
+            elif not row.is_folder and self._locally_edited(row):
+                edited.append(row)
+            else:
+                present.append(row)
+        return present, edited
+
+    def _keep_edited_as_new(self, edited: list[FileState]):
+        """AC-17: an edit made here is not lost because Drive deleted the file."""
+        for row in edited:
+            log.warning("Deleted on Drive but changed here, uploading as a new file: %s",
+                        row.path)
+            self.state_db.delete_by_path(row.path)
+            self._upload_local_file(row.path)
+
+    def _trash_and_forget(self, rel_path: str) -> bool:
+        local_path = self.local_root / rel_path
+        if self._suppress_fn:
+            self._suppress_fn(rel_path)
+        try:
+            self._trash_local(local_path)
+        except Exception as e:
+            # Never fall back to a permanent deletion (spec "Must not")
+            log.error("Could not move %s to the trash: %s", rel_path, e)
+            self.state_db.set_sync_status(rel_path, "error")
+            if self._overlay:
+                self._overlay.set_file_error(rel_path)
+            return False
+        finally:
+            self._unsuppress_later(rel_path)
+        self.state_db.delete_tree(rel_path)
+        log.info("Moved to the trash: %s", rel_path)
+        return True
+
+    def _remove_locally(self, root_path: str):
+        """Move what Drive deleted to the desktop trash, keeping local edits."""
+        present, edited = self._split_for_drive_deletion(root_path)
+        if not present and not edited:
+            return
+        if not edited:
+            self._trash_and_forget(root_path)  # a folder goes as one item
+            return
+        for row in present:
+            if row.is_folder:
+                self.state_db.delete_by_path(row.path)  # recreated on upload
+            else:
+                self._trash_and_forget(row.path)
+        self._keep_edited_as_new(edited)
+
+    def _delete_local_file(self, file_id: str):
+        """A synced file or folder was moved to Drive's bin (or deleted there)."""
+        if not self._initial_sync_done():
+            return
+        state = self.state_db.get_by_file_id(file_id)
+        if not state:
+            return
+        if self._safe_mode:
+            present, edited = self._split_for_drive_deletion(state.path)
+            for row in present:
+                self.state_db.set_sync_status(row.path, DELETED_ON_DRIVE)
+                if self._overlay and not row.is_folder:
+                    self._overlay.set_file_deleted_on_drive(row.path)
+            if present:
+                log.info("Deleted on Drive, kept here until you delete it: %s", state.path)
+            self._keep_edited_as_new(edited)
+        else:
+            self._remove_locally(state.path)
+        self._notify_deletions()
+
+    def flush_drive_deletions(self):
+        """Move every item deleted on Drive to the desktop trash (the user confirmed)."""
+        for rel_path in self.deleted_on_drive():
+            self._remove_locally(rel_path)
+        self._notify_deletions()
 
     def _handle_local_move(self, old_path: str, new_path: str):
         """Handle a local file rename/move."""
@@ -1048,33 +1296,6 @@ class SyncEngine:
             return True
         return any(indicator in error_str for indicator in unsyncable_indicators)
 
-    def _delete_local_file(self, file_id: str):
-        """Delete a local file that was trashed on remote."""
-        if self._safe_mode:
-            log.info("SAFE MODE: would delete local file (id=%s) — skipped", file_id)
-            return
-
-        state = self.state_db.get_by_file_id(file_id)
-        if not state:
-            return
-
-        local_path = self.local_root / state.path
-        if local_path.exists():
-            # Only delete if unmodified locally
-            local_hash = md5_file(local_path)
-            if local_hash != state.local_md5:
-                log.warning("Local file modified, keeping: %s", state.path)
-                self.state_db.delete_by_file_id(file_id)
-                return
-
-            if self._suppress_fn:
-                self._suppress_fn(state.path)
-            local_path.unlink()
-            log.info("Deleted local: %s", state.path)
-            self._unsuppress_later(state.path)
-
-        self.state_db.delete_by_file_id(file_id)
-
     def _save_conflict(self, path: Path):
         """Save a conflict copy of a local file."""
         stem = path.stem
@@ -1183,6 +1404,9 @@ class SyncEngine:
             return
 
         old_path = state.path
+        if state.sync_status == DELETED_ON_DRIVE:  # restored from Drive's bin
+            self.state_db.set_sync_status(old_path, "synced")
+            self._notify_deletions()
         if new_path == old_path:
             return  # No change
 
@@ -1228,7 +1452,7 @@ class SyncEngine:
             # Check if folder exists in state
             dir_path = "/".join(parts[:depth])
             state = self.state_db.get_by_path(dir_path)
-            if state:
+            if state and state.sync_status != DELETED_ON_DRIVE:
                 parent_id = state.file_id
             else:
                 # Check on Drive

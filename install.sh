@@ -47,6 +47,11 @@ if [ -f "$SCRIPT_DIR/assets/syncopath-icon.svg" ]; then
     cp "$SCRIPT_DIR/assets/syncopath-icon.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/syncopath.svg"
     _icons_installed=$((_icons_installed + 1))
 fi
+# Thunar emblems (sync status overlays on files)
+mkdir -p "$HOME/.local/share/icons/hicolor/scalable/emblems"
+cp "$SCRIPT_DIR"/assets/emblems/emblem-syncopath-*.svg "$HOME/.local/share/icons/hicolor/scalable/emblems/"
+_icons_installed=$((_icons_installed + 1))
+
 if [ "$_icons_installed" -eq 0 ]; then
     echo "  (no icon assets found — skipping icon install)"
 else
