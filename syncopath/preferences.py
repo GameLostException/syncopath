@@ -399,7 +399,10 @@ class PreferencesWindow(Gtk.Window):
 
     def _refresh_swm_stats(self, account_data: dict):
         """Fetch shared-with-me stats from Drive API in background."""
-        self._swm_stats_spinner.start()
+        # The result goes to THIS account's widgets, even if the user has selected
+        # another account (and rebuilt the tab) by the time it arrives.
+        label, spinner = self._swm_stats_label, self._swm_stats_spinner
+        spinner.start()
 
         def _fetch():
             try:
@@ -410,9 +413,9 @@ class PreferencesWindow(Gtk.Window):
                 stats = drive.get_shared_with_me_stats()
                 # Cache the result
                 self._cache_swm_stats(account_data["name"], stats)
-                GLib.idle_add(self._on_swm_stats_loaded, stats, None)
+                GLib.idle_add(self._on_swm_stats_loaded, stats, None, label, spinner)
             except Exception as e:
-                GLib.idle_add(self._on_swm_stats_loaded, None, str(e))
+                GLib.idle_add(self._on_swm_stats_loaded, None, str(e), label, spinner)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -430,18 +433,22 @@ class PreferencesWindow(Gtk.Window):
         except Exception as e:
             log.warning("Failed to cache swm stats: %s", e)
 
-    def _on_swm_stats_loaded(self, stats: dict, error: str):
-        """Update UI with shared-with-me stats (main thread)."""
-        self._swm_stats_spinner.stop()
+    def _on_swm_stats_loaded(self, stats: dict, error: str, label=None, spinner=None):
+        """Update UI with shared-with-me stats (main thread).
+
+        label/spinner: the widgets of the account that requested the stats.
+        """
+        label = label or self._swm_stats_label
+        (spinner or self._swm_stats_spinner).stop()
 
         if error:
-            self._swm_stats_label.set_markup(f"<small><i>⚠ {GLib.markup_escape_text(str(error))}</i></small>")
+            label.set_markup(f"<small><i>⚠ {GLib.markup_escape_text(str(error))}</i></small>")
             return False
 
-        self._update_swm_stats_label(stats)
+        self._update_swm_stats_label(stats, label)
         return False
 
-    def _update_swm_stats_label(self, stats: dict):
+    def _update_swm_stats_label(self, stats: dict, label=None):
         """Format and display shared-with-me stats."""
         file_count = stats.get("file_count", 0)
         total_size = stats.get("total_size", 0)
@@ -456,7 +463,7 @@ class PreferencesWindow(Gtk.Window):
         else:
             size_str = f"{total_size} bytes"
 
-        self._swm_stats_label.set_markup(
+        (label or self._swm_stats_label).set_markup(
             f"<small>{file_count:,} files · {size_str}</small>")
 
     def _on_save_account_general(self, account_data: dict):
