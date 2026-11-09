@@ -13,37 +13,6 @@ from syncopath.local_watcher import LocalChangeEvent
 from tests.mock_drive import MockDriveAPI
 
 
-@pytest.fixture
-def setup(tmp_path):
-    """Create a full test environment with mock Drive."""
-    local_root = tmp_path / "gdrive"
-    local_root.mkdir()
-
-    config = AccountConfig(
-        name="test",
-        local_path=local_root,
-        remote_id="root",
-        poll_interval=30,
-        debounce=1,
-        include_shared_with_me=False,
-    )
-
-    with patch("syncopath.state.STATE_DIR", tmp_path / "state"), \
-         patch("syncopath.sync_engine.CONFIG_DIR", tmp_path / "config"):
-        (tmp_path / "state").mkdir()
-        (tmp_path / "config").mkdir()
-        state_db = StateDB("test")
-        drive = MockDriveAPI()
-        engine = SyncEngine(config, drive, state_db)
-        yield {
-            "engine": engine,
-            "drive": drive,
-            "state_db": state_db,
-            "local_root": local_root,
-            "config": config,
-        }
-
-
 class TestFullSyncCycle:
     """Test: create remote file → detect change → download → verify local."""
 

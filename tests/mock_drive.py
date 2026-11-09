@@ -41,7 +41,6 @@ class MockDriveAPI:
     def __init__(self):
         self._files: dict[str, MockDriveFile] = {}
         self._root_id = "mock-root-id-000"
-        self._page_token_counter = 0
         self._changes: list[dict] = []  # Pending changes since last token
         self._real_root_id = self._root_id
         self.shared_drive_id = None
@@ -59,7 +58,8 @@ class MockDriveAPI:
         return self._real_root_id
 
     def get_start_page_token(self) -> str:
-        return str(self._page_token_counter)
+        """Like Drive: the token points at 'now', so only later changes are returned."""
+        return str(len(self._changes))
 
     def get_changes(self, page_token: str) -> tuple[list[dict], str]:
         """Return changes since the given token."""
@@ -227,8 +227,8 @@ class MockDriveAPI:
         """Find a folder by name under a given parent. Returns ID or None."""
         for f in self._files.values():
             if (f.name == name and f.mime_type == "application/vnd.google-apps.folder"
-                    and not f.trashed and f.parent_id == parent_id):
-                return f.file_id
+                    and not f.trashed and parent_id in f.parents):
+                return f.id
         return None
 
     def move_file(self, file_id: str, body=None, add_parents=None, remove_parents=None):
@@ -239,7 +239,7 @@ class MockDriveAPI:
         if body and "name" in body:
             f.name = body["name"]
         if add_parents:
-            f.parent_id = add_parents
+            f.parents = [add_parents]
         self._changes.append({
             "fileId": file_id,
             "removed": False,

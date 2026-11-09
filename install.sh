@@ -26,14 +26,11 @@ echo "→ Initializing config..."
 # 4. Install systemd service
 echo "→ Installing systemd service..."
 mkdir -p ~/.config/systemd/user
-cp "$SCRIPT_DIR/systemd/syncopath.service" ~/.config/systemd/user/
+sed "s|@INSTALL_DIR@|$SCRIPT_DIR|g" "$SCRIPT_DIR/systemd/syncopath.service" \
+    > ~/.config/systemd/user/syncopath.service
 systemctl --user daemon-reload
 
-# 5. Create log directory (for manual runs — service uses journald)
-echo "→ Creating log directory /var/log/syncopath ..."
-sudo install -d -m 755 -o "$(id -un)" /var/log/syncopath
-
-# 6. Install icon (skip silently if sized PNGs not yet generated)
+# 5. Install icon (skip silently if sized PNGs not yet generated)
 echo "→ Installing tray icon..."
 _icons_installed=0
 for size in 16 24 32 48 64 128 256; do
@@ -68,6 +65,6 @@ echo ""
 echo "Commands:"
 echo "  Status:   systemctl --user status syncopath"
 echo "  Logs:     journalctl --user -u syncopath -f"
-echo "  Log file: tail -f /var/log/syncopath/syncopath.log  (manual runs only)"
+echo "  Log file: tail -f ~/.local/state/syncopath/syncopath.log  (manual runs only)"
 echo "  Stop:     systemctl --user stop syncopath"
 echo "  Restart:  systemctl --user restart syncopath"

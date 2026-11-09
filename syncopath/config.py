@@ -135,6 +135,7 @@ class AppConfig:
                 shared_drive_id=acc.get("shared_drive_id", ""),
                 include_shared_with_me=acc.get("include_shared_with_me", False),
                 max_file_size_mb=acc.get("max_file_size_mb", 0),
+                bandwidth_limit_kib=acc.get("bandwidth_limit_kib", 0),
             ))
 
         # Validate: no sync dir can be contained by another

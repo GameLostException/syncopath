@@ -98,12 +98,17 @@ class _Handler(FileSystemEventHandler):
 class LocalWatcher:
     """Watches a local directory for changes with debouncing."""
 
-    def __init__(self, root: Path, exclude: list[str], debounce: float = 5.0):
+    def __init__(self, root: Path, exclude: list[str], debounce: float = 5.0,
+                 max_delay: float = 30.0):
         self.root = root
         self.exclude = exclude
         self.debounce = debounce
-        self._observer = Observer()
+        # A steady stream of events (a build, a download) must not postpone the
+        # flush forever: a batch is flushed at most max_delay after its first event.
+        self.max_delay = max(max_delay, debounce)
+        self._observer = None
         self._pending: dict[str, LocalChangeEvent] = {}
+        self._first_pending_at: float = 0.0
         self._lock = threading.Lock()
         self._callback: Callable = None
         self._debounce_timer: threading.Timer = None
@@ -123,33 +128,40 @@ class LocalWatcher:
         """Start watching. Callback receives batched changes after debounce."""
         self._callback = callback
         handler = _Handler(self.root, self.exclude, self._on_event)
+        # An Observer is a thread and cannot be restarted: make a new one each time
+        self._observer = Observer()
         self._observer.schedule(handler, str(self.root), recursive=True)
         self._observer.start()
         log.info("Watching local directory: %s", self.root)
 
     def stop(self):
-        """Stop watching."""
-        try:
+        """Stop watching, and hand over the events already collected."""
+        if self._observer is not None:
             self._observer.stop()
             self._observer.join()
-        except RuntimeError:
-            pass  # Observer was never started
+            self._observer = None
         if self._debounce_timer:
             self._debounce_timer.cancel()
+        self._flush()
 
     def _on_event(self, event: LocalChangeEvent):
         """Collect events and debounce."""
+        now = time.monotonic()
         with self._lock:
             if event.path in self._suppress_paths:
                 return
+            if not self._pending:
+                self._first_pending_at = now
             # Deduplicate: latest event for same path wins
             self._pending[event.path] = event
+            delay = min(self.debounce, self._first_pending_at + self.max_delay - now)
 
-        # Reset debounce timer
-        if self._debounce_timer:
-            self._debounce_timer.cancel()
-        self._debounce_timer = threading.Timer(self.debounce, self._flush)
-        self._debounce_timer.start()
+            # Reset debounce timer, but never past the batch's deadline
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+            self._debounce_timer = threading.Timer(max(delay, 0.0), self._flush)
+            self._debounce_timer.daemon = True
+            self._debounce_timer.start()
 
     def _flush(self):
         """Flush pending events to callback."""

@@ -9,6 +9,7 @@ thread processes them sequentially. This guarantees:
 - Correct ordering (FIFO within each source, interleaved fairly)
 - Retry capability (failed items can be re-enqueued with backoff)
 """
+import itertools
 import logging
 import queue
 import threading
@@ -18,6 +19,15 @@ from enum import Enum
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+
+
+class SyncBatchError(Exception):
+    """Some items of a batch failed; only those are retried (ADR-0001)."""
+
+    def __init__(self, failed_items: list, errors: list):
+        self.failed_items = failed_items
+        self.errors = errors
+        super().__init__(f"{len(failed_items)} item(s) failed; first error: {errors[0]!r}")
 
 
 class EventType(Enum):
@@ -36,7 +46,9 @@ class SyncEvent:
     Priority: 0 = highest (shutdown), 1 = folder ops, 2 = normal, 3 = background.
     """
     priority: int
-    event_type: EventType = field(compare=False)
+    # Tiebreaker: heapq does not keep insertion order among equal priorities
+    seq: int = field(default_factory=itertools.count().__next__)
+    event_type: EventType = field(compare=False, default=None)
     payload: Any = field(compare=False, default=None)
     attempt: int = field(compare=False, default=0)
     max_attempts: int = field(compare=False, default=3)
@@ -70,6 +82,9 @@ class SyncWorker:
         self._running = False
         self._processing = False
         self._status_callback = status_callback
+        # Cleared while paused: events stay queued until resume().
+        self._unpaused = threading.Event()
+        self._unpaused.set()
 
         # Handlers
         self._on_local_changes = None
@@ -102,6 +117,13 @@ class SyncWorker:
         if self._thread:
             self._thread.join(timeout=timeout)
         log.info("Sync worker stopped")
+
+    def pause(self):
+        """Stop taking new events; queued and new events wait for resume()."""
+        self._unpaused.clear()
+
+    def resume(self):
+        self._unpaused.set()
 
     @property
     def is_busy(self) -> bool:
@@ -148,6 +170,8 @@ class SyncWorker:
     def _run(self):
         """Main worker loop — processes events sequentially."""
         while self._running:
+            if not self._unpaused.wait(timeout=1.0):
+                continue
             try:
                 event = self._queue.get(timeout=1.0)
             except queue.Empty:
@@ -155,6 +179,11 @@ class SyncWorker:
 
             if event.event_type == EventType.SHUTDOWN:
                 break
+            if not self._unpaused.is_set():
+                # Paused while we were waiting: put it back, keeping its place
+                self._queue.put(event)
+                self._queue.task_done()
+                continue
 
             self._processing = True
             try:
@@ -185,6 +214,8 @@ class SyncWorker:
 
     def _handle_failure(self, event: SyncEvent, error: Exception):
         """Handle a failed event — retry with backoff or give up."""
+        if isinstance(error, SyncBatchError):
+            event.payload = error.failed_items  # retry only what failed
         event.attempt += 1
         log.error("Event %s failed (attempt %d/%d): %s",
                   event.event_type.value, event.attempt, event.max_attempts, error)
