@@ -11,7 +11,8 @@ from typing import Optional
 
 from .config import AccountConfig, CONFIG_DIR
 from .drive_api import (DriveAPI, GOOGLE_NATIVE_MIMES, GOOGLE_EXPORT_MAP, GOOGLE_SKIP_MIMES,
-                        is_not_found, is_skip_mime, is_transient, sanitize_filename)
+                        is_auth_error, is_not_found, is_skip_mime, is_transient,
+                        sanitize_filename)
 from .state import StateDB, FileState
 from .local_watcher import LocalChangeEvent
 from .remote_watcher import RemoteChange
@@ -274,8 +275,13 @@ class SyncEngine:
                 if local_path.exists():
                     local_hash = md5_file(local_path)
 
-                    # Error row with a local edit that never reached Drive: upload it
-                    if state.sync_status == "error" and local_hash != state.local_md5:
+                    # Error row with a local edit that never reached Drive: upload it.
+                    # A failed upload keeps the hash of the last synced content, or has
+                    # no file_id when the file was new. A failed download (including rows
+                    # from older versions, which stored local_md5=NULL) is neither.
+                    pending_upload = state.local_md5 is not None or not state.file_id
+                    if (state.sync_status == "error" and pending_upload
+                            and local_hash != state.local_md5):
                         try:
                             self._upload_local_file(state.path)
                         except Exception as e:
@@ -1026,8 +1032,8 @@ class SyncEngine:
         - File is not readable (permission denied on local side)
         - File is a special file (socket, fifo, device)
         """
-        if is_transient(error):
-            return False
+        if is_transient(error) or is_auth_error(error):
+            return False  # retried, and recorded for reconcile
         error_str = str(error).lower()
         unsyncable_indicators = [
             "invalid",

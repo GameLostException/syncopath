@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -106,6 +107,19 @@ def is_not_found(error: Exception) -> bool:
     return isinstance(error, FileNotFoundError) or http_status(error) == 404
 
 
+def is_auth_error(error: Exception) -> bool:
+    """Credentials expired or revoked: nothing is wrong with the file itself."""
+    return isinstance(error, RefreshError) or http_status(error) == 401
+
+
+def _error_reasons(error: Exception) -> set:
+    details = getattr(error, "error_details", None) or []
+    reasons = {d.get("reason") for d in details if isinstance(d, dict)}
+    # Older googleapiclient versions do not parse the details list
+    reasons.update(r for r in _RATE_LIMIT_REASONS if r in str(error))
+    return reasons
+
+
 def is_transient(error: Exception) -> bool:
     """A retry later may succeed: network failure, rate limit or server error."""
     if isinstance(error, (ConnectionError, TimeoutError, ssl.SSLError, httplib2.HttpLib2Error)):
@@ -115,7 +129,7 @@ def is_transient(error: Exception) -> bool:
     status = http_status(error)
     if status == 429 or (status is not None and status >= 500):
         return True
-    return status == 403 and any(r in str(error) for r in _RATE_LIMIT_REASONS)
+    return status == 403 and bool(_error_reasons(error) & set(_RATE_LIMIT_REASONS))
 
 
 # ─── Bandwidth limiting ──────────────────────────────────────────────────
@@ -530,11 +544,8 @@ class DriveAPI:
         """Upload or update a file on Drive."""
         mime_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
         limited = self.bandwidth_limit_kib > 0
-        if limited:
-            media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True,
-                                    chunksize=THROTTLED_CHUNK_SIZE)
-        else:
-            media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
+        chunking = {"chunksize": THROTTLED_CHUNK_SIZE} if limited else {}
+        media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True, **chunking)
 
         metadata = {"name": local_path.name}
 

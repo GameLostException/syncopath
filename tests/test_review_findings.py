@@ -445,3 +445,90 @@ class TestWorkerOrdering:
             assert results == list(range(20))
         finally:
             worker.stop(timeout=2)
+
+
+# ─── Coalesce review, 2026-11-09 ──────────────────────────────────────────
+
+class TestCoalesceReview:
+
+    def test_legacy_download_error_row_is_redownloaded_not_uploaded(self, setup):
+        """Old code stored local_md5=NULL on download errors; the stale local copy must not win."""
+        env = setup
+        drive, root, state_db = env["drive"], env["local_root"], env["state_db"]
+        file_id = drive.add_file("doc.txt", content=b"old")
+        env["engine"].initial_sync()
+        drive.simulate_remote_change(file_id, new_content=b"newer remote")
+        row = state_db.get_by_path("doc.txt")
+        row.local_md5, row.local_mtime, row.sync_status = None, 0, "error"
+        row.remote_md5 = drive._files[file_id].md5
+        state_db.upsert(row)
+
+        env["engine"].reconcile()
+
+        assert drive._files[file_id].content == b"newer remote"
+        assert (root / "doc.txt").read_bytes() == b"newer remote"
+
+    def test_auth_failure_is_retryable_not_unsyncable(self, tmp_path):
+        from google.auth.exceptions import RefreshError
+        assert SyncEngine._is_upload_unsyncable(
+            RefreshError("invalid_grant: Token has been expired or revoked."),
+            tmp_path / "x.txt") is False
+
+    def _daemon_with_refused_account(self, tmp_path):
+        import syncopath.__main__ as main_mod
+        daemon = main_mod.SyncoPathDaemon.__new__(main_mod.SyncoPathDaemon)
+        daemon.tray = MagicMock()
+        daemon._overlays, daemon._workers = [], []
+        daemon._running = True
+        daemon._stop = threading.Event()
+        engine = MagicMock()
+        engine.initial_sync.side_effect = ValueError("Directory is not empty")
+        state_db = MagicMock()
+        state_db.get_page_token.return_value = None
+        acc = {"config": MagicMock(local_path=tmp_path), "engine": engine,
+               "state_db": state_db, "local_watcher": MagicMock(),
+               "remote_watcher": MagicMock()}
+        acc["config"].name = "acc"
+        daemon.accounts = [acc]
+        return daemon, acc
+
+    def test_resume_does_not_start_an_account_that_never_started(self, tmp_path):
+        daemon, acc = self._daemon_with_refused_account(tmp_path)
+        try:
+            daemon._start_sync()
+            daemon._resume_all()
+            acc["remote_watcher"].start.assert_not_called()
+            acc["local_watcher"].start.assert_not_called()
+        finally:
+            daemon._stop.set()
+            for w in daemon._workers:
+                w.stop(timeout=2)
+
+    def test_failed_account_is_not_reported_as_synced(self, tmp_path):
+        daemon, acc = self._daemon_with_refused_account(tmp_path)
+        try:
+            daemon._start_sync()
+            status, _detail = daemon.tray.update_status.call_args.args
+            assert status == "error"
+        finally:
+            daemon._stop.set()
+            for w in daemon._workers:
+                w.stop(timeout=2)
+
+
+class TestConfigLoad:
+
+    def test_bandwidth_limit_saved_by_preferences_is_loaded(self, tmp_path):
+        import json
+        from syncopath import config as cfg
+        (tmp_path / "client_secret.json").write_text(json.dumps(
+            {"installed": {"client_id": "cid", "client_secret": "sec"}}))
+        (tmp_path / "config.yaml").write_text(
+            "accounts:\n"
+            "  - name: a\n"
+            f"    local_path: {tmp_path / 'drive'}\n"
+            "    bandwidth_limit_kib: 512\n")
+        with patch.object(cfg, "CONFIG_DIR", tmp_path), \
+             patch.object(cfg, "CONFIG_FILE", tmp_path / "config.yaml"):
+            loaded = cfg.AppConfig.load()
+        assert loaded.accounts[0].bandwidth_limit_kib == 512

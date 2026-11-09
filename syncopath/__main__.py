@@ -135,7 +135,12 @@ class SyncoPathDaemon:
             t.start()
         for t in threads:
             t.join()
-        if self._running:
+        if not self._running:
+            return
+        stopped = [acc["config"].name for acc in self.accounts if "worker" not in acc]
+        if stopped:
+            self.tray.update_status("error", f"Not syncing: {', '.join(stopped)}")
+        else:
             self.tray.update_status("idle", "All accounts synced")
 
     def _start_account(self, acc: dict):
@@ -163,8 +168,7 @@ class SyncoPathDaemon:
         )
         worker.pause()
         worker.start()
-        self._workers.append(worker)
-        acc["worker"] = worker
+        self._workers.append(worker)  # stopped on quit, even if startup fails
 
         first_run = state_db.get_page_token() is None
         if first_run:
@@ -187,6 +191,7 @@ class SyncoPathDaemon:
         remote_watcher.start(worker.enqueue_remote)
         worker.enqueue_reconcile()  # catches error/stale files from the previous run
         worker.resume()
+        acc["worker"] = worker  # only a fully started account is paused/resumed
 
         def _periodic_reconcile():
             while not self._stop.wait(_RECONCILE_INTERVAL):
