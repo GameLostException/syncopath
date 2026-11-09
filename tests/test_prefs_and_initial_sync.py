@@ -133,6 +133,8 @@ class TestSharedWithMeStatsBelongToTheirAccount:
 
     def test_slow_result_for_first_account_does_not_overwrite_second(self):
         prefs = MagicMock()
+        prefs._current_account = {"name": "first"}
+        prefs._is_shown = lambda name: PreferencesWindow._is_shown(prefs, name)
         prefs._on_swm_stats_loaded = lambda *a: PreferencesWindow._on_swm_stats_loaded(prefs, *a)
         prefs._update_swm_stats_label = (
             lambda *a: PreferencesWindow._update_swm_stats_label(prefs, *a))
@@ -154,8 +156,80 @@ class TestSharedWithMeStatsBelongToTheirAccount:
             # The user selects the second account: its tab and label replace the first
             second_label = Gtk.Label(label="222 files · 0 bytes")
             prefs._swm_stats_label = second_label
+            prefs._current_account = {"name": "second"}
 
             fetches[0]()  # the first account's slow fetch finishes now
 
         assert second_label.get_text() == "222 files · 0 bytes"
-        assert "111" in first_label.get_text()
+
+
+# ─── 5. Background results of one account land in another's tabs ────────────
+
+ISSUE = {"path": "doc.pdf", "type": "orphan", "reason": "Cloud file trashed"}
+
+
+def _prefs_showing(account_name):
+    prefs = MagicMock()
+    prefs._current_account = {"name": account_name}
+    prefs._is_shown = lambda name: PreferencesWindow._is_shown(prefs, name)
+    return prefs
+
+
+def _issues_widgets(prefs):
+    prefs._issues_spinner = Gtk.Spinner()
+    prefs._issues_status = Gtk.Label(label="Scanning...")
+    prefs._issues_tab_label = Gtk.Label(label="Issues")
+    prefs._issues_listbox = Gtk.ListBox()
+
+
+class TestResultsStayWithTheirAccount:
+
+    def test_issues_of_another_account_are_dropped(self):
+        prefs = _prefs_showing("second")
+        _issues_widgets(prefs)
+        PreferencesWindow._on_issues_loaded(prefs, [ISSUE], None, {"name": "first"})
+        assert prefs._issues_tab_label.get_text() == "Issues"
+        assert prefs._issues_listbox.get_children() == []
+        assert prefs._issues_status.get_text() == "Scanning..."
+
+    def test_issues_of_the_shown_account_are_displayed(self):
+        prefs = _prefs_showing("second")
+        _issues_widgets(prefs)
+        PreferencesWindow._on_issues_loaded(prefs, [ISSUE], None, {"name": "second"})
+        assert prefs._issues_tab_label.get_text() == "Issues (1)"
+        assert len(prefs._issues_listbox.get_children()) == 1
+
+    def test_shared_drives_of_another_account_are_dropped(self):
+        prefs = _prefs_showing("second")
+        prefs._shared_drives_box = Gtk.Box()
+        prefs._shared_drives_box.add(Gtk.Label(label="second's drive"))
+        prefs._shared_drives_status = Gtk.Label(label="1 shared drive(s) available.")
+        PreferencesWindow._on_shared_drives_loaded(
+            prefs, [{"id": "d9", "name": "Finance"}], None, {"name": "first"})
+        assert [c.get_text() for c in prefs._shared_drives_box.get_children()] == ["second's drive"]
+        prefs._create_shared_drive_row.assert_not_called()
+        prefs._fetch_shared_drive_sizes.assert_not_called()
+
+    def test_shared_drive_size_of_another_account_is_dropped(self):
+        prefs = _prefs_showing("second")
+        label = Gtk.Label(label="2.0 GB")
+        prefs._shared_drive_size_labels = {"d1": label}
+        PreferencesWindow._on_drive_size_ready(prefs, "d1", 0, ERROR, "first")
+        assert label.get_text() == "2.0 GB"
+
+    def test_shared_drive_size_of_the_shown_account_is_displayed(self):
+        prefs = _prefs_showing("second")
+        label = Gtk.Label()
+        prefs._shared_drive_size_labels = {"d1": label}
+        prefs._format_storage_size = lambda b: "1.0 KB"
+        PreferencesWindow._on_drive_size_ready(prefs, "d1", 1024, None, "second")
+        assert label.get_text() == "1.0 KB"
+
+    def test_shared_with_me_stats_of_another_account_are_dropped(self):
+        prefs = _prefs_showing("second")
+        prefs._swm_stats_label = Gtk.Label(label="222 files · 0 bytes")
+        prefs._update_swm_stats_label = (
+            lambda *a: PreferencesWindow._update_swm_stats_label(prefs, *a))
+        PreferencesWindow._on_swm_stats_loaded(
+            prefs, {"file_count": 111, "total_size": 0}, None, "first")
+        assert prefs._swm_stats_label.get_text() == "222 files · 0 bytes"
