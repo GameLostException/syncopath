@@ -125,3 +125,37 @@ class TestInitialSyncLowDisk:
         except Exception as e:
             raised = e
         assert raised is not None and not isinstance(raised, ValueError)
+
+
+# ─── 4. "Shared with me" stats of one account overwrite another's ───────────
+
+class TestSharedWithMeStatsBelongToTheirAccount:
+
+    def test_slow_result_for_first_account_does_not_overwrite_second(self):
+        prefs = MagicMock()
+        prefs._on_swm_stats_loaded = lambda *a: PreferencesWindow._on_swm_stats_loaded(prefs, *a)
+        prefs._update_swm_stats_label = (
+            lambda *a: PreferencesWindow._update_swm_stats_label(prefs, *a))
+        first_label = Gtk.Label()
+        prefs._swm_stats_label = first_label
+
+        fetches = []
+        acc_a = MagicMock()
+        acc_a.name = "first"
+        drive = MagicMock()
+        drive.get_shared_with_me_stats.return_value = {"file_count": 111, "total_size": 0}
+        with patch.object(preferences.threading, "Thread",
+                          lambda target, daemon: MagicMock(start=lambda: fetches.append(target))), \
+             patch.object(preferences.GLib, "idle_add", lambda fn, *args: fn(*args)), \
+             patch.object(preferences.AppConfig, "load", return_value=MagicMock(accounts=[acc_a])), \
+             patch("syncopath.drive_api.DriveAPI", return_value=drive):
+            PreferencesWindow._refresh_swm_stats(prefs, {"name": "first"})  # fetch starts
+
+            # The user selects the second account: its tab and label replace the first
+            second_label = Gtk.Label(label="222 files · 0 bytes")
+            prefs._swm_stats_label = second_label
+
+            fetches[0]()  # the first account's slow fetch finishes now
+
+        assert second_label.get_text() == "222 files · 0 bytes"
+        assert "111" in first_label.get_text()
