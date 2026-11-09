@@ -29,6 +29,7 @@ EMBLEM_ERROR = "syncopath-error"
 EMBLEM_WARNING = "syncopath-warning"
 EMBLEM_PENDING = "syncopath-pending"
 EMBLEM_UNKNOWN = "syncopath-unknown"
+EMBLEM_DELETED = "syncopath-deleted"  # purple bin: deleted on Drive, kept here
 
 
 class FileStatus(Enum):
@@ -38,7 +39,25 @@ class FileStatus(Enum):
     WARNING = "warning"
     PENDING = "pending"
     UNKNOWN = "unknown"
+    DELETED_ON_DRIVE = "deleted_on_drive"
     NONE = "none"
+
+
+# State DB sync_status → emblem status
+STATUS_FROM_DB = {
+    "synced": FileStatus.SYNCED,
+    "syncing": FileStatus.SYNCING,
+    "pending": FileStatus.PENDING,
+    "error": FileStatus.ERROR,
+    "warning": FileStatus.WARNING,
+    "unknown": FileStatus.UNKNOWN,
+    "deleted_on_drive": FileStatus.DELETED_ON_DRIVE,
+}
+
+# A folder shows the first of these found anywhere inside it
+FOLDER_PRIORITY = [FileStatus.ERROR, FileStatus.WARNING, FileStatus.DELETED_ON_DRIVE,
+                   FileStatus.UNKNOWN, FileStatus.SYNCING, FileStatus.PENDING,
+                   FileStatus.SYNCED]
 
 
 class ThunarOverlay:
@@ -149,6 +168,7 @@ class ThunarOverlay:
             FileStatus.WARNING: EMBLEM_WARNING,
             FileStatus.PENDING: EMBLEM_PENDING,
             FileStatus.UNKNOWN: EMBLEM_UNKNOWN,
+            FileStatus.DELETED_ON_DRIVE: EMBLEM_DELETED,
             FileStatus.NONE: None,
         }
         emblem = emblem_map.get(status)
@@ -191,6 +211,11 @@ class ThunarOverlay:
         Used for actual failures: network errors, permission denied, etc.
         """
         self.set_file_status(rel_path, FileStatus.ERROR)
+        self._update_parent_dirs(rel_path)
+
+    def set_file_deleted_on_drive(self, rel_path: str):
+        """Mark a file that is in Drive's bin but kept here (purple bin)."""
+        self.set_file_status(rel_path, FileStatus.DELETED_ON_DRIVE)
         self._update_parent_dirs(rel_path)
 
     def set_file_warning(self, rel_path: str):
@@ -262,14 +287,7 @@ class ThunarOverlay:
         # Get all known statuses from DB in one query
         known_statuses = state_db.get_all_paths_with_status()
 
-        status_to_file_status = {
-            "synced": FileStatus.SYNCED,
-            "syncing": FileStatus.SYNCING,
-            "pending": FileStatus.PENDING,
-            "error": FileStatus.ERROR,
-            "warning": FileStatus.WARNING,
-            "unknown": FileStatus.UNKNOWN,
-        }
+        status_to_file_status = STATUS_FROM_DB
 
         # Track per-file status for directory computation
         file_statuses: dict[str, FileStatus] = {}
@@ -314,8 +332,7 @@ class ThunarOverlay:
                 dirs.add(path)
 
         # Priority: lower index = higher priority
-        priority = [FileStatus.ERROR, FileStatus.WARNING, FileStatus.UNKNOWN,
-                    FileStatus.SYNCING, FileStatus.PENDING, FileStatus.SYNCED]
+        priority = FOLDER_PRIORITY
 
         count = 0
         for dir_path in sorted(dirs):
@@ -357,17 +374,9 @@ class ThunarOverlay:
         parts = file_path.parts[:-1]  # parent directories
 
         known_statuses = state_db.get_all_paths_with_status()
-        status_to_file_status = {
-            "synced": FileStatus.SYNCED,
-            "syncing": FileStatus.SYNCING,
-            "pending": FileStatus.PENDING,
-            "error": FileStatus.ERROR,
-            "warning": FileStatus.WARNING,
-            "unknown": FileStatus.UNKNOWN,
-        }
+        status_to_file_status = STATUS_FROM_DB
 
-        priority = [FileStatus.ERROR, FileStatus.WARNING, FileStatus.UNKNOWN,
-                    FileStatus.SYNCING, FileStatus.PENDING, FileStatus.SYNCED]
+        priority = FOLDER_PRIORITY
 
         # Walk up from the file to the root, updating each parent dir
         for i in range(len(parts)):

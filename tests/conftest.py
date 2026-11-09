@@ -1,4 +1,5 @@
 """Shared fixtures: a SyncEngine wired to an in-memory Drive and a temp state DB."""
+import shutil
 from unittest.mock import patch
 
 import pytest
@@ -32,8 +33,17 @@ def make_env(tmp_path):
         state_db = StateDB(config.name)
         drive = MockDriveAPI()
         engine = SyncEngine(config, drive, state_db, safe_mode=safe_mode)
+        # Never touch the real desktop trash: "trash" into a temp folder instead
+        trash = tmp_path / f"trash{len(created)}"
+        trash.mkdir()
+
+        def fake_trash(path):
+            target = trash / f"{len(list(trash.iterdir()))}-{path.name}"
+            shutil.move(str(path), str(target))
+
+        engine._trash_local = fake_trash
         env = {"engine": engine, "drive": drive, "state_db": state_db,
-               "local_root": local_root, "config": config}
+               "local_root": local_root, "config": config, "trash": trash}
         created.append(env)
         return env
 

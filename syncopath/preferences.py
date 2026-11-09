@@ -11,6 +11,8 @@ from gi.repository import Gtk, GLib, Gdk, Pango
 
 import yaml
 
+from .trash import move_to_trash
+
 from .config import (
     CONFIG_FILE, CONFIG_DIR, TOKENS_DIR, STATE_DIR,
     AppConfig, sanitize_dirname, default_account_path,
@@ -1442,7 +1444,7 @@ class PreferencesWindow(Gtk.Window):
 
         local_path = local_root / issue['path']
         if local_path.exists():
-            local_path.unlink()
+            move_to_trash(local_path)  # never a permanent deletion
         state_db.delete_by_path(issue['path'])
 
         # Refresh list

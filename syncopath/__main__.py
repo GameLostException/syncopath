@@ -77,6 +77,7 @@ class SyncoPathDaemon:
             engine.set_watcher_suppress(local_watcher.suppress, local_watcher.unsuppress)
             engine.set_status_callback(self._on_status_change)
             engine.set_progress_callback(self._on_progress_change)
+            engine.set_deletions_callback(self._refresh_deletion_counts)
 
             # Setup Thunar overlay integration
             overlay = ThunarOverlay(acc_config.name, acc_config.local_path)
@@ -101,6 +102,8 @@ class SyncoPathDaemon:
             on_quit=self._quit,
             on_open_folder=self._open_folder,
             on_preferences=self._show_preferences,
+            on_pending_deletions=self._show_pending_deletions,
+            on_drive_deletions=self._trash_drive_deletions,
         )
 
     def run(self):
@@ -199,6 +202,7 @@ class SyncoPathDaemon:
         threading.Thread(target=_periodic_reconcile, daemon=True,
                          name="periodic-reconcile").start()
 
+        self._refresh_deletion_counts()
         log.info("Account '%s' syncing: %s", acc_name, acc["config"].local_path)
 
     def _initial_sync_with_retry(self, acc: dict) -> bool:
@@ -271,6 +275,52 @@ class SyncoPathDaemon:
                 remote_watcher.trigger_poll()
                 # Also enqueue a reconcile to catch any local drift.
                 worker.enqueue_reconcile()
+
+    # ─── Deletions waiting for the user (docs/specs/deletion.md) ─────────
+
+    def _refresh_deletion_counts(self):
+        """Update the tray's two deletion items (callable from any thread)."""
+        local = sum(len(acc["engine"].pending_local_deletions()) for acc in self.accounts)
+        drive = sum(len(acc["engine"].deleted_on_drive()) for acc in self.accounts)
+        self.tray.update_deletions(local, drive)
+
+    def _confirm(self, message: str, action: str) -> bool:
+        """Modal yes/no dialog on the GTK main thread."""
+        dialog = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.NONE, text=message)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, action, Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        try:
+            return dialog.run() == Gtk.ResponseType.OK
+        finally:
+            dialog.destroy()
+
+    def _show_pending_deletions(self):
+        from .deletion_list import show_pending_deletions
+        items = [(acc["config"].name, item) for acc in self.accounts
+                 for item in acc["engine"].pending_local_deletions()]
+        show_pending_deletions(items, on_send_all=self._send_local_deletions)
+
+    def _send_local_deletions(self):
+        count = sum(len(acc["engine"].pending_local_deletions()) for acc in self.accounts)
+        if not count:
+            return
+        if not self._confirm(f"Send {count} deletion(s) to Drive's bin?", "Send to bin"):
+            return
+        for acc in self.accounts:
+            if acc.get("worker"):
+                acc["worker"].enqueue_task(acc["engine"].flush_local_deletions)
+
+    def _trash_drive_deletions(self):
+        count = sum(len(acc["engine"].deleted_on_drive()) for acc in self.accounts)
+        if not count:
+            return
+        if not self._confirm(f"Move {count} item(s) deleted on Drive to the trash?",
+                             "Move to trash"):
+            return
+        for acc in self.accounts:
+            if acc.get("worker"):
+                acc["worker"].enqueue_task(acc["engine"].flush_drive_deletions)
 
     def _open_folder(self):
         """Open the first account's sync folder."""

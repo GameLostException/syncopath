@@ -36,6 +36,7 @@ class EventType(Enum):
     REMOTE_CHANGES = "remote_changes"
     RECONCILE = "reconcile"
     FOLDER_INDEX = "folder_index"
+    TASK = "task"  # payload: a callable run on the worker thread
     SHUTDOWN = "shutdown"
 
 
@@ -160,6 +161,10 @@ class SyncWorker:
             event_type=EventType.RECONCILE,
         ))
 
+    def enqueue_task(self, fn):
+        """Run `fn()` on the worker thread, after the work already queued."""
+        self._queue.put(SyncEvent(priority=2, event_type=EventType.TASK, payload=fn))
+
     def enqueue_folder_index(self):
         """Enqueue a folder re-indexing pass."""
         self._queue.put(SyncEvent(
@@ -211,6 +216,9 @@ class SyncWorker:
         elif event.event_type == EventType.FOLDER_INDEX:
             if self._on_folder_index:
                 self._on_folder_index()
+
+        elif event.event_type == EventType.TASK:
+            event.payload()
 
     def _handle_failure(self, event: SyncEvent, error: Exception):
         """Handle a failed event — retry with backoff or give up."""

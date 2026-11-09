@@ -28,13 +28,17 @@ error handling and UI callbacks in one 1,300-line unit.
 
 ## Open questions — the owner's call
 
-- **A file missing locally, unchanged remotely, no delete event seen** (deleted while
+- **Deletion semantics — settled 2026-11-09** in the
+  [deletion specification](../specs/deletion.md) (safe mode lists and marks deletions until
+  the user confirms; unsafe mode mirrors them; everything goes through a bin). The two
+  bullets below are kept for the record and are superseded by it.
+- ~~**A file missing locally, unchanged remotely, no delete event seen**~~ (deleted while
   the daemon was stopped, or the disk was not mounted). Today it is re-downloaded,
   so local deletions come back; in safe mode this happens every 10 minutes.
   *Recommendation:* if the sync root itself is missing or empty, do nothing and
   raise an error (an unmounted disk); otherwise treat it as a local delete and
   apply the safe-mode rule (safe mode on: forget it locally, keep it on Drive).
-- **Safe mode and a local delete event.** Today, with safe mode on, the file is
+- ~~**Safe mode and a local delete event.**~~ Today, with safe mode on, the file is
   restored by the next reconcile. *Recommendation:* safe mode means "never delete
   on the *other* side" — stop tracking it, do not restore it.
 - **Reset state** (Preferences). Today the next start runs an initial sync, which

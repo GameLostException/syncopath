@@ -38,7 +38,8 @@ syncopath --prefs               Open the preferences window only
 syncopath --list-shared-drives  List the shared drives of the first account
 ```
 
-The tray menu offers Sync Now, Pause/Resume, Open Folder, Preferences and Quit. The
+The tray menu offers Sync Now, Pause/Resume, Open Folder, Preferences and Quit, plus the
+deletions waiting for your confirmation in safe mode ([how deletions work](docs/specs/deletion.md)). The
 [user manual](docs/USER_MANUAL.md) describes every feature and the troubleshooting steps.
 
 ## Configuration
