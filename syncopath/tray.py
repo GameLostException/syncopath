@@ -7,13 +7,13 @@ from typing import Callable, Optional
 
 import gi
 gi.require_version("Gtk", "3.0")
-gi.require_version("AppIndicator3", "0.1")
 gi.require_version("GdkPixbuf", "2.0")
 
 from gi.repository import Gtk, GLib, GdkPixbuf, Pango
 
 # Try AppIndicator first (works on XFCE), fall back to StatusIcon
 try:
+    gi.require_version("AppIndicator3", "0.1")  # raises if not installed
     from gi.repository import AppIndicator3
     HAS_APPINDICATOR = True
 except (ImportError, ValueError):

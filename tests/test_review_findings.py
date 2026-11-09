@@ -532,3 +532,25 @@ class TestConfigLoad:
              patch.object(cfg, "CONFIG_FILE", tmp_path / "config.yaml"):
             loaded = cfg.AppConfig.load()
         assert loaded.accounts[0].bandwidth_limit_kib == 512
+
+
+class TestTrayImport:
+
+    def test_tray_imports_without_appindicator(self):
+        """The StatusIcon fallback must be reachable when AppIndicator3 is not installed."""
+        import importlib
+        import gi
+        import syncopath.tray as tray
+        real = gi.require_version
+
+        def no_appindicator(namespace, version):
+            if namespace == "AppIndicator3":
+                raise ValueError("Namespace AppIndicator3 not available")
+            return real(namespace, version)
+
+        try:
+            with patch.object(gi, "require_version", no_appindicator):
+                importlib.reload(tray)
+            assert tray.HAS_APPINDICATOR is False
+        finally:
+            importlib.reload(tray)
