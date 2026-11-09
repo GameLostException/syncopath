@@ -20,7 +20,7 @@ SyncoPath keeps a folder on your Linux machine in sync with your Google Drive. C
 ### Setup
 
 ```bash
-cd ~/Lab/syncopath
+cd syncopath   # the cloned repository
 ./install.sh
 ```
 
@@ -86,12 +86,15 @@ The tray icon shows sync status at a glance:
 
 ### Startup Sequence
 
-When SyncoPath starts, the tray shows each phase:
+Accounts start in parallel. For each one the tray shows:
 1. "Starting {account}..." — Initializing
 2. "Restoring file emblems..." — Marking files in Thunar
-3. "Indexing folders..." — Building folder tree from Drive
-4. "Scanning local files..." — Finding new local files
-5. "Starting watchers..." — Enabling real-time sync
+3. On the first run, "Initial sync for {account}..." — downloads everything. If it fails
+   (for example, no network), it is retried after 30 s, 1 min, 2 min, then every 5 min.
+   If the folder is not empty it is refused, and the tray shows "Not syncing: {account}".
+4. Otherwise: "Indexing folders...", "Scanning local files...", "Checking for missing
+   remote files..." — catching up with what changed while SyncoPath was stopped.
+   Local edits made during these steps are queued and synced right after.
 
 ### Tray Menu
 
@@ -102,7 +105,8 @@ Right-click the tray icon for:
 - **Current file** — Name and size of the file being transferred
 - **Sync Now** — Force an immediate sync check + reconcile
 - **Open Folder** — Open the sync directory in Thunar
-- **Pause/Resume** — Temporarily stop/restart syncing
+- **Pause/Resume** — Stop watching for changes and hold queued work; Resume picks up
+  everything that changed in the meantime
 - **Preferences** — Open settings window
 - **Quit** — Graceful shutdown
 
@@ -141,6 +145,7 @@ Settings with override checkboxes (tick to override global default):
 - **Local change debounce** (seconds): Wait time before processing local changes (1-30s)
 - **Conflict resolution**: Newer wins / Always keep local / Always keep remote
 - **Max file size (MB)**: Files larger than this are excluded from sync (0 = no limit)
+- **Bandwidth limit**: Caps download and upload speed (100 KiB/s to 20 MiB/s, or Unlimited)
 
 #### Exclusions Tab
 - Glob patterns for files/folders to exclude (one per line)
@@ -170,8 +175,12 @@ Settings with override checkboxes (tick to override global default):
 ### Conflict Resolution
 When the same file is modified both locally and on Drive between syncs:
 - **Winner**: The version with the newer modification time
-- **Loser**: Saved as `filename.conflict.ext` alongside the winner
-- You can then compare and choose which to keep
+- **Drive is newer**: your local version is saved as `filename.conflict.ext` (on this
+  machine only) and the Drive version is downloaded
+- **Local is newer**: your local version is uploaded; the previous Drive version stays in
+  the file's version history on Drive
+- The Sync tab's "Conflict resolution" choice is saved but not applied yet: the newer
+  version always wins
 
 ### Google Docs Export
 Google Docs, Sheets, and Slides are exported as:
@@ -207,6 +216,7 @@ Set a per-account maximum file size. Files above this limit are excluded from sy
 ### Self-Healing Reconcile
 Every 10 minutes, SyncoPath automatically:
 - Verifies all tracked files exist and match their remote versions
+- Re-uploads local changes whose upload failed (for example, during a network outage)
 - Re-downloads files that were corrupted or have mismatched hashes
 - Removes state entries for files whose access was revoked (404)
 - Catches up on changes missed during downtime
@@ -225,13 +235,22 @@ Only one instance of SyncoPath can run at a time (PID file lock). This prevents 
 4. Restart: `systemctl --user restart syncopath`
 
 ### File has error emblem
-The file failed to sync. Click "Sync Now" — the reconcile will attempt to fix it. Check logs for details.
+The file failed to sync. A failed transfer is retried twice within about 90 seconds, then
+by the reconcile every 10 minutes. Click "Sync Now" to retry immediately. Check logs for details.
 
 ### Files not uploading
 - Check if the file matches an exclusion pattern
 - Check if it exceeds the max file size limit
 - Check if it's in the "Shared with me" folder (read-only)
 - Check logs for upload errors
+
+### "Not syncing: {account}" in the tray
+The account did not start, usually because its folder was not empty on the first sync.
+Empty or change the folder, then restart: `systemctl --user restart syncopath`.
+
+### Logs of a manual run
+When you run `syncopath` from a terminal, logs also go to
+`~/.local/state/syncopath/syncopath.log`. The service logs to journald.
 
 ### Tray icon missing
 AppIndicator may not be running. Ensure `xfce4-indicator-plugin` is in your panel.
