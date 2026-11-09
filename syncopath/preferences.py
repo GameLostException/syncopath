@@ -2,6 +2,7 @@
 import logging
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,10 @@ log = logging.getLogger(__name__)
 
 
 # ─── Account List Row ───────────────────────────────────────────────────────
+
+# After "Authenticate", how long the window watches for the new token
+_AUTH_WATCH_SECONDS = 600
+
 
 class AccountRow(Gtk.ListBoxRow):
     """A row representing one sync account in the left panel."""
@@ -54,7 +59,7 @@ class AccountRow(Gtk.ListBoxRow):
         # Account info
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         name_label = Gtk.Label()
-        name_label.set_markup(f"<b>{account_data['name']}</b>")
+        name_label.set_markup(f"<b>{GLib.markup_escape_text(account_data['name'])}</b>")
         name_label.set_xalign(0)
         vbox.pack_start(name_label, False, False, 0)
 
@@ -268,7 +273,7 @@ class PreferencesWindow(Gtk.Window):
         name_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         name_box.pack_start(Gtk.Label(label="Account:"), False, False, 0)
         name_label = Gtk.Label()
-        name_label.set_markup(f"<b>{acc_name}</b>")
+        name_label.set_markup(f"<b>{GLib.markup_escape_text(acc_name)}</b>")
         name_box.pack_start(name_label, False, False, 0)
         vbox.pack_start(name_box, False, False, 0)
 
@@ -430,7 +435,7 @@ class PreferencesWindow(Gtk.Window):
         self._swm_stats_spinner.stop()
 
         if error:
-            self._swm_stats_label.set_markup(f"<small><i>⚠ {error}</i></small>")
+            self._swm_stats_label.set_markup(f"<small><i>⚠ {GLib.markup_escape_text(str(error))}</i></small>")
             return False
 
         self._update_swm_stats_label(stats)
@@ -484,11 +489,28 @@ class PreferencesWindow(Gtk.Window):
                     subprocess.Popen([term, "-e", cmd])
                 self._show_info(
                     f"Authentication started for '{account_name}'.\n"
-                    "Complete the OAuth flow in your browser, then close the terminal.")
+                    "Complete the OAuth flow in your browser, then close the terminal.\n"
+                    "This window updates when sign-in completes. Restart SyncoPath "
+                    "to start syncing a new account.")
+                GLib.timeout_add_seconds(2, self._check_auth_done, account_name, time.time())
                 return
             except FileNotFoundError:
                 continue
         self._show_info("No terminal emulator found. Run manually:\n\n" + cmd)
+
+    def _check_auth_done(self, account_name: str, started_at: float) -> bool:
+        """Timer callback: refresh the window once sign-in has written the token.
+        Returns False to stop the timer."""
+        token_path = TOKENS_DIR / f"{account_name}.json"
+        if token_path.exists() and token_path.stat().st_mtime >= started_at:
+            log.info("Sign-in completed for %s", account_name)
+            self._refresh_account_list()
+            for row in self._accounts_listbox.get_children():
+                if getattr(row, "data", {}).get("name") == account_name:
+                    self._accounts_listbox.select_row(row)
+                    break
+            return False
+        return time.time() - started_at < _AUTH_WATCH_SECONDS
 
     def _do_deauthenticate(self, account_name: str):
         """Deauthenticate an account after confirmation."""
@@ -679,7 +701,7 @@ class PreferencesWindow(Gtk.Window):
             return False
 
         if error:
-            label.set_markup(f"<small><i>⚠ {error}</i></small>")
+            label.set_markup(f"<small><i>⚠ {GLib.markup_escape_text(str(error))}</i></small>")
         else:
             size_str = self._format_storage_size(usage_bytes)
             label.set_markup(f"<small><b>{size_str}</b></small>")
@@ -1363,7 +1385,7 @@ class PreferencesWindow(Gtk.Window):
         self._issues_spinner.stop()
 
         if error:
-            self._issues_status.set_markup(f"<small><i>Error: {error}</i></small>")
+            self._issues_status.set_markup(f"<small><i>Error: {GLib.markup_escape_text(str(error))}</i></small>")
             self._issues_tab_label.set_text("Issues")
             return False
 
@@ -1631,7 +1653,7 @@ class PreferencesWindow(Gtk.Window):
 
         # Config path
         path_label = Gtk.Label()
-        path_label.set_markup(f"<small>Config: <tt>{CONFIG_FILE}</tt></small>")
+        path_label.set_markup(f"<small>Config: <tt>{GLib.markup_escape_text(str(CONFIG_FILE))}</tt></small>")
         path_label.set_xalign(0)
         path_label.set_opacity(0.5)
         vbox.pack_end(path_label, False, False, 0)

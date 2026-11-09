@@ -27,6 +27,10 @@ DELETED_ON_DRIVE = "deleted_on_drive"  # in Drive's bin, kept here until the use
 SHARED_WITH_ME = "Shared with me"      # local folder of files owned by others
 
 
+class NotEnoughDiskSpace(Exception):
+    """The initial sync stopped for lack of space; it resumes on the next attempt."""
+
+
 class PendingDeletion(NamedTuple):
     path: str
     is_folder: bool
@@ -241,11 +245,14 @@ class SyncEngine:
                 file_size = int(f.get("size", 0) or 0)
                 self._progress_callback(synced_count, total_files, rel_path, file_size)
 
+            if not self._check_disk_space():
+                # Not complete: no page token, so the next attempt resumes here
+                self._overlay = overlay_backup
+                raise NotEnoughDiskSpace(
+                    f"Not enough free disk space; initial sync stopped at {rel_path}")
+
             # Download
             try:
-                if not self._check_disk_space():
-                    log.warning("Sync paused due to low disk space at file: %s", rel_path)
-                    break
                 self._download_file(f, rel_path)
             except Exception as e:
                 # _download_file handles warning/error classification internally
