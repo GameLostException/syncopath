@@ -105,6 +105,10 @@ Right-click the tray icon for:
 - **Current file** — Name and size of the file being transferred
 - **Sync Now** — Force an immediate sync check + reconcile
 - **Open Folder** — Open the sync directory in Thunar
+- **Pending deletions (N)…** — Safe mode only, shown while there are some: what you deleted
+  here, waiting to be sent to Drive's bin
+- **Delete files removed from Drive (N)…** — Safe mode only, shown while there are some:
+  move the files with the purple bin emblem to your trash, after confirmation
 - **Pause/Resume** — Stop watching for changes and hold queued work; Resume picks up
   everything that changed in the meantime
 - **Preferences** — Open settings window
@@ -193,10 +197,20 @@ These are snapshots — collaborative editing happens on Drive.
 
 ### Thunar File Emblems
 In Thunar (XFCE file manager), files show sync status overlays:
-- ✅ Green checkmark: Synced
-- 🔄 Blue arrows: Syncing
-- ⚠️ Yellow warning: Unsyncable / size excluded
-- ❌ Red X: Error
+
+| Emblem | Meaning |
+|--------|---------|
+| Green check | Synced: local and Drive match |
+| Blue arrows | Syncing: being uploaded or downloaded |
+| Grey clock | Pending: change seen, queued |
+| Grey question mark | Unknown: not checked yet, or not tracked |
+| Orange triangle | Unsyncable: too big to export, over the size limit, unsupported type, bad name |
+| Red circle, white cross | Error: transfer failed; retried, then by reconcile |
+| Purple circle, white bin | Deleted on Drive: in Drive's bin, kept here until you delete it (safe mode) |
+
+A folder shows the most serious emblem found inside it, in this order: error, unsyncable,
+deleted on Drive, unknown, syncing, pending, synced. The emblem icons are installed by
+`install.sh`.
 
 ### Shared with Me
 When "Include Shared with me" is enabled:
@@ -204,8 +218,32 @@ When "Include Shared with me" is enabled:
 - These files are **read-only** — local edits are NOT uploaded
 - Shared subfolders inside your owned folders are detected and excluded when the setting is OFF
 
-### Safe Mode
-When enabled (default), files are **never deleted** on either side. If you delete a file locally, it stays on Drive. If someone trashes it on Drive, it stays locally.
+### Deletions and Safe Mode
+Once an account's first sync has finished, deletions travel between your computer and Drive.
+SyncoPath never deletes anything permanently: local deletions go to your desktop trash, Drive
+deletions go to Drive's bin, and it never empties either bin. The full rules are in the
+[deletion specification](specs/deletion.md).
+
+**Safe mode on (default)** — nothing is deleted without your confirmation:
+- *You delete a file or folder here:* it stays on Drive. The tray menu shows
+  **Pending deletions (N)…**, which lists them and has one button, **Send all to Drive's bin**,
+  that asks for confirmation. To keep one item, restore it from the trash; it leaves the list.
+- *Someone moves a file to Drive's bin:* it stays here with the purple bin emblem. The tray
+  menu shows **Delete files removed from Drive (N)…**, which asks for confirmation and then
+  moves them to your trash. Restoring the file on Drive removes the emblem.
+
+**Safe mode off** — deletions are mirrored at the next sync: deleted here goes to Drive's bin,
+deleted on Drive goes to your trash.
+
+**In both modes:**
+- An edit is never lost to a deletion. If a file was changed on Drive after you deleted it
+  here, the Drive version comes back. If you changed a file here and it was deleted on Drive,
+  your version is kept and uploaded to Drive as a new file.
+- Files deleted while SyncoPath was stopped are treated as deletions at the next start, unless
+  the sync folder is missing or empty: then SyncoPath assumes the disk is not mounted, reports
+  an error and deletes nothing.
+- Deleting a file you don't own (for example in "Shared with me") only stops syncing it;
+  Drive is not changed.
 
 ### Disk Space Protection
 Sync automatically pauses with an error status if free disk space drops below the configured threshold (default: 5 GB).

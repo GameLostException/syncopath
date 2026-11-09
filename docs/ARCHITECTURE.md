@@ -72,6 +72,8 @@ SyncoPath is a bidirectional Google Drive sync daemon for Linux. It keeps a loca
 | `state.py` | SQLite state database CRUD, WAL mode, serialised access |
 | `local_watcher.py` | inotify watcher with debouncing and suppression |
 | `remote_watcher.py` | Changes API poller with watchdog and failure backoff |
+| `trash.py` | Moves local files to the desktop trash (never deletes them) |
+| `deletion_list.py` | Window listing the local deletions waiting for confirmation |
 | `config.py` | YAML config loading, path validation, sanitization |
 | `tray.py` | GTK tray icon, animations, progress display |
 | `thunar_overlay.py` | File status emblems via libcloudproviders D-Bus |
@@ -155,7 +157,8 @@ CREATE TABLE files (
     local_mtime REAL,             -- Local file mtime at last sync
     mime_type TEXT,               -- MIME type
     is_folder INTEGER DEFAULT 0,  -- 1 for folders
-    sync_status TEXT DEFAULT 'unknown'  -- synced/error/warning/unknown
+    sync_status TEXT DEFAULT 'unknown'  -- synced/error/warning/unknown,
+                                        -- pending_delete/deleted_on_drive (see specs/deletion.md)
 );
 
 CREATE TABLE metadata (
