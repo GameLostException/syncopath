@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Optional
 
 from .config import AccountConfig, CONFIG_DIR
-from .drive_api import DriveAPI, GOOGLE_NATIVE_MIMES, GOOGLE_EXPORT_MAP, GOOGLE_SKIP_MIMES, is_skip_mime, sanitize_filename
+from .drive_api import (DriveAPI, GOOGLE_NATIVE_MIMES, GOOGLE_EXPORT_MAP, GOOGLE_SKIP_MIMES,
+                        is_not_found, is_skip_mime, is_transient, sanitize_filename)
 from .state import StateDB, FileState
 from .local_watcher import LocalChangeEvent
 from .remote_watcher import RemoteChange
+from .sync_worker import SyncBatchError
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +63,20 @@ class SyncEngine:
         """Set functions to suppress/unsuppress local watcher events."""
         self._suppress_fn = suppress_fn
         self._unsuppress_fn = unsuppress_fn
+
+    def _unsuppress_later(self, *rel_paths: str):
+        """Re-enable local events for paths we just wrote, after the watcher's debounce."""
+        if self._unsuppress_fn:
+            delay = self.config.debounce + 1
+            for rel_path in rel_paths:
+                threading.Timer(delay, self._unsuppress_fn, args=[rel_path]).start()
+
+    def _root_ids(self) -> set:
+        """IDs that mean 'the top of this sync root'."""
+        ids = {self.config.remote_id, self.drive.get_real_root_id(), "root",
+               self.drive.shared_drive_id}
+        ids.discard(None)
+        return ids
 
     def set_status_callback(self, callback):
         """Set callback for sync status updates: callback(status, detail)."""
@@ -127,13 +143,15 @@ class SyncEngine:
         """Perform full initial sync — downloads everything from remote."""
         from .config import validate_sync_dir_empty
 
-        # On first sync, ensure target directory is empty to prevent mixing files
-        if not any(self.local_root.iterdir()) if self.local_root.exists() else True:
-            pass  # Good — empty or non-existent
-        else:
-            # Directory has contents — check if we have state (resuming) vs truly new
-            if self.state_db.get_page_token() is None:
-                validate_sync_dir_empty(self.local_root)
+        # A brand-new sync root must be empty, so we never mix unrelated files in.
+        # An initial sync that was interrupted is resumed instead.
+        if self.state_db.get_meta("initial_sync") is None:
+            validate_sync_dir_empty(self.local_root)
+        self.state_db.set_meta("initial_sync", "started")
+
+        # Take the change cursor BEFORE listing: edits made while we download
+        # are then replayed by the Changes API instead of being skipped.
+        start_token = self.drive.get_start_page_token()
 
         self._notify_status("syncing", "Initial sync...")
         log.info("Starting initial sync for %s", self.config.name)
@@ -202,9 +220,7 @@ class SyncEngine:
                 log.warning("Skipping file %s: %s", rel_path, e)
                 continue
 
-        # Get page token for future change tracking
-        token = self.drive.get_start_page_token()
-        self.state_db.set_page_token(token)
+        self.state_db.set_page_token(start_token)
 
         # Restore overlay and bulk-mark all files as synced (in background)
         self._overlay = overlay_backup
@@ -257,6 +273,14 @@ class SyncEngine:
 
                 if local_path.exists():
                     local_hash = md5_file(local_path)
+
+                    # Error row with a local edit that never reached Drive: upload it
+                    if state.sync_status == "error" and local_hash != state.local_md5:
+                        try:
+                            self._upload_local_file(state.path)
+                        except Exception as e:
+                            log.warning("Reconcile: re-upload failed %s: %s", state.path, e)
+                        continue
 
                     # For error files: verify hash matches remote before marking synced
                     if state.sync_status == "error" and state.remote_md5:
@@ -322,8 +346,7 @@ class SyncEngine:
                             # File trashed on remote — remove from state
                             self.state_db.delete_by_path(state.path)
                     except Exception as e:
-                        err_str = str(e)
-                        if "404" in err_str or "notFound" in err_str:
+                        if is_not_found(e):
                             # Access revoked or file permanently deleted
                             log.info("Reconcile: access lost for %s, removing",
                                      state.path)
@@ -549,6 +572,7 @@ class SyncEngine:
                 if event.event_type in ("created", "modified"):
                     self._overlay.set_file_pending(event.path)
 
+        failed, errors = [], []
         try:
             for i, event in enumerate(events):
                 try:
@@ -561,8 +585,12 @@ class SyncEngine:
                     self._handle_local_event(event)
                 except Exception as e:
                     log.error("Error handling local event %s: %s", event, e)
+                    failed.append(event)
+                    errors.append(e)
         finally:
             self._notify_status("idle")
+        if failed:
+            raise SyncBatchError(failed, errors)
 
     def handle_remote_changes(self, changes: list[RemoteChange]):
         """Process remote Drive changes — download/delete locally."""
@@ -585,6 +613,7 @@ class SyncEngine:
                     if state:
                         self._overlay.set_file_pending(state.path)
 
+        failed, errors = [], []
         try:
             for i, change in enumerate(all_ordered):
                 try:
@@ -598,8 +627,12 @@ class SyncEngine:
                     self._handle_remote_event(change)
                 except Exception as e:
                     log.error("Error handling remote change %s: %s", change, e)
+                    failed.append(change)
+                    errors.append(e)
         finally:
             self._notify_status("idle")
+        if failed:
+            raise SyncBatchError(failed, errors)
 
     def _handle_local_event(self, event: LocalChangeEvent):
         """Handle a single local filesystem event."""
@@ -684,7 +717,7 @@ class SyncEngine:
                 log.warning("Unsyncable (upload) %s: %s", rel_path, e)
                 self.state_db.upsert(FileState(
                     path=rel_path,
-                    file_id=file_id or "",
+                    file_id=file_id,
                     remote_md5=None,
                     local_md5=local_hash,
                     remote_mtime="",
@@ -695,7 +728,18 @@ class SyncEngine:
                 if self._overlay:
                     self._overlay.set_file_warning(rel_path)
             else:
-                # Mark file as error in Thunar
+                # Record the failure so reconcile can retry it: keep the hash of the
+                # last synced content, so "local differs from local_md5" stays true.
+                self.state_db.upsert(FileState(
+                    path=rel_path,
+                    file_id=file_id,
+                    remote_md5=state.remote_md5 if state else None,
+                    local_md5=state.local_md5 if state else None,
+                    remote_mtime=state.remote_mtime if state else "",
+                    local_mtime=state.local_mtime if state else 0,
+                    mime_type=state.mime_type if state else "application/octet-stream",
+                    sync_status="error",
+                ))
                 if self._overlay:
                     self._overlay.set_file_error(rel_path)
                 raise
@@ -761,21 +805,12 @@ class SyncEngine:
                 add_parents = new_parent_id
                 remove_parents = old_parent_id
 
-        try:
-            kwargs = {"fileId": state.file_id, "supportsAllDrives": True}
-            if body:
-                kwargs["body"] = body
-            if add_parents:
-                kwargs["addParents"] = add_parents
-            if remove_parents:
-                kwargs["removeParents"] = remove_parents
-
-            self.drive.move_file(state.file_id, body=body or None,
-                                   add_parents=add_parents, remove_parents=remove_parents)
-            self.state_db.rename(old_path, new_path)
-            log.info("Moved remote: %s -> %s", old_path, new_path)
-        except Exception as e:
-            log.error("Failed to move remote: %s", e)
+        self.drive.move_file(state.file_id, body=body or None,
+                             add_parents=add_parents, remove_parents=remove_parents)
+        self.state_db.rename(old_path, new_path)
+        if state.is_folder:
+            self.state_db.rename_prefix(old_path, new_path)
+        log.info("Moved remote: %s -> %s", old_path, new_path)
 
     def _download_or_conflict(self, change: RemoteChange):
         """Download a remote file, handling conflicts."""
@@ -831,10 +866,7 @@ class SyncEngine:
                         self._suppress_fn(new_rel_path)
                     old_local.rename(new_local)
                     log.info("Renamed file: %s -> %s", state.path, new_rel_path)
-                    if self._unsuppress_fn:
-                        debounce = self.config.debounce + 1
-                        threading.Timer(debounce, self._unsuppress_fn, args=[state.path]).start()
-                        threading.Timer(debounce, self._unsuppress_fn, args=[new_rel_path]).start()
+                    self._unsuppress_later(state.path, new_rel_path)
 
                 # Update state DB
                 self.state_db.delete_by_path(state.path)
@@ -881,8 +913,10 @@ class SyncEngine:
                     self._save_conflict(local_path)
                     log.warning("Conflict (remote wins): %s", rel_path)
                 else:
-                    # Local wins — skip download, will upload on next local event
+                    # Local wins — push the local version (Drive keeps the
+                    # overwritten one in the file's revision history)
                     log.warning("Conflict (local wins): %s", rel_path)
+                    self._upload_local_file(rel_path)
                     return
 
         # Download
@@ -938,24 +972,26 @@ class SyncEngine:
                     self._overlay.set_file_warning(rel_path)
             else:
                 log.error("Failed to download %s: %s", rel_path, e)
+                # Keep the hash of what is on disk, so reconcile knows the local
+                # copy is unchanged and re-downloads rather than uploads it.
+                previous = self.state_db.get_by_path(rel_path)
                 self.state_db.upsert(FileState(
                     path=rel_path,
                     file_id=meta["id"],
                     remote_md5=meta.get("md5Checksum"),
-                    local_md5=None,
+                    local_md5=previous.local_md5 if previous else None,
                     remote_mtime=meta["modifiedTime"],
-                    local_mtime=0,
+                    local_mtime=previous.local_mtime if previous else 0,
                     mime_type=mime_type,
                     sync_status="error",
                 ))
                 if self._overlay:
                     self._overlay.set_file_error(rel_path)
+                if is_transient(e):
+                    raise
         finally:
-            # Unsuppress after download completes — wait for debounce window
-            # so inotify doesn't pick up the just-written file as a new change
-            if self._unsuppress_fn:
-                debounce = self.config.debounce + 1  # slightly more than watcher debounce
-                threading.Timer(debounce, self._unsuppress_fn, args=[rel_path]).start()
+            # Wait out the watcher's debounce so our own write is not seen as an edit
+            self._unsuppress_later(rel_path)
 
     @staticmethod
     def _is_unsyncable_error(error: Exception) -> bool:
@@ -990,16 +1026,16 @@ class SyncEngine:
         - File is not readable (permission denied on local side)
         - File is a special file (socket, fifo, device)
         """
+        if is_transient(error):
+            return False
         error_str = str(error).lower()
         unsyncable_indicators = [
             "invalid",
             "file name too long",
             "notfound",  # parent folder gone
         ]
-        # Permission errors on the local file itself
-        if isinstance(error, PermissionError):
-            return True
-        if isinstance(error, OSError) and "errno" in error_str:
+        # Local file problems: unreadable, special file, too long a name, ...
+        if isinstance(error, OSError):
             return True
         # Check filename length (Drive limit is 255 chars)
         if len(local_path.name) > 255:
@@ -1029,8 +1065,7 @@ class SyncEngine:
                 self._suppress_fn(state.path)
             local_path.unlink()
             log.info("Deleted local: %s", state.path)
-            if self._unsuppress_fn:
-                threading.Timer(2.0, self._unsuppress_fn, args=[state.path]).start()
+            self._unsuppress_later(state.path)
 
         self.state_db.delete_by_file_id(file_id)
 
@@ -1157,10 +1192,7 @@ class SyncEngine:
 
             old_local.rename(new_local)
             log.info("Renamed folder: %s -> %s", old_path, new_path)
-
-            if self._unsuppress_fn:
-                threading.Timer(2.0, self._unsuppress_fn, args=[old_path]).start()
-                threading.Timer(2.0, self._unsuppress_fn, args=[new_path]).start()
+            self._unsuppress_later(old_path, new_path)
 
         # Update state DB: folder itself
         self.state_db.upsert(FileState(
@@ -1186,9 +1218,9 @@ class SyncEngine:
         parts = Path(rel_path).parts[:-1]  # All dirs except the filename
         parent_id = self.config.remote_id
 
-        for part in parts:
+        for depth, part in enumerate(parts, start=1):
             # Check if folder exists in state
-            dir_path = str(Path(*parts[: parts.index(part) + 1]))
+            dir_path = "/".join(parts[:depth])
             state = self.state_db.get_by_path(dir_path)
             if state:
                 parent_id = state.file_id
@@ -1215,38 +1247,47 @@ class SyncEngine:
         return parent_id
 
     def _resolve_remote_path(self, meta: dict) -> Optional[str]:
-        """Resolve the relative path for a remote file from its parents."""
+        """Resolve the local relative path of a remote file from its parent chain.
+
+        Returns None when the chain does not lead into this sync root (unless
+        "Shared with me" is synced, in which case it goes under that folder).
+        Raises on transient API errors — never returns a guessed, partial path.
+        """
         parts = [sanitize_filename(meta["name"])]
         current = meta
-
-        # Get the real root ID (resolves 'root' alias to actual folder ID)
-        real_root_id = self.drive.get_real_root_id()
-        root_ids = {self.config.remote_id, real_root_id, "root"}
+        root_ids = self._root_ids()
+        seen = set()
 
         while True:
-            parents = current.get("parents", [])
+            parents = current.get("parents") or []
             if not parents:
-                break
+                return self._outside_root_path(parts)
             parent_id = parents[0]
             if parent_id in root_ids:
-                break
+                return "/".join(parts)
+            if parent_id in seen:
+                return None  # cycle
+            seen.add(parent_id)
 
-            # Check state DB first
+            # Known folder: its stored path is the full prefix
             state = self.state_db.get_by_file_id(parent_id)
             if state:
-                # Use the full stored path (not just the name)
-                parts = state.path.split("/") + parts
-                break
+                return "/".join(state.path.split("/") + parts)
 
-            # Query Drive for parent name
             try:
                 parent_meta = self.drive.get_file_metadata(parent_id)
-                parts.insert(0, sanitize_filename(parent_meta["name"]))
-                current = parent_meta
-            except Exception:
-                break
+            except Exception as e:
+                if is_not_found(e):  # the chain leaves what we can see
+                    return self._outside_root_path(parts)
+                raise
+            parts.insert(0, sanitize_filename(parent_meta["name"]))
+            current = parent_meta
 
-        return "/".join(parts)
+    def _outside_root_path(self, parts: list[str]) -> Optional[str]:
+        """Path for a file whose parent chain does not reach our root."""
+        if self.config.include_shared_with_me:
+            return "/".join(["Shared with me"] + parts)
+        return None
 
     def _is_shared_file(self, meta: dict) -> bool:
         """Check if a file is shared with us (not owned by us).
@@ -1264,8 +1305,7 @@ class SyncEngine:
 
         # Walk parent chain to check ownership via API
         current = meta
-        real_root_id = self.drive.get_real_root_id()
-        root_ids = {self.config.remote_id, real_root_id, "root"}
+        root_ids = self._root_ids()
         checked = set()
 
         while True:
@@ -1291,6 +1331,7 @@ class SyncEngine:
                 if parent_meta.get("ownedByMe") is False:
                     return True
                 current = parent_meta
-            except Exception:
-                # Can't verify — assume shared (safer)
-                return True
+            except Exception as e:
+                if is_not_found(e):  # outside what we can see: not ours
+                    return True
+                raise  # transient: retry later rather than silently skip

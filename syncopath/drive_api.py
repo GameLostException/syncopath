@@ -1,8 +1,11 @@
 """Google Drive API wrapper for SyncoPath."""
+import errno
 import json
 import logging
 import mimetypes
+import ssl
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -12,6 +15,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import httplib2
 
 from .config import TOKENS_DIR
 
@@ -77,6 +81,61 @@ def is_skip_mime(mime_type: str) -> bool:
     if mime_type.startswith("application/vnd.google-apps.drive-sdk"):
         return True
     return False
+
+
+# ─── Error classification (ADR-0001) ─────────────────────────────────────
+
+_NETWORK_ERRNOS = {errno.ENETUNREACH, errno.ENETDOWN, errno.EHOSTUNREACH,
+                   errno.ETIMEDOUT, errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE}
+_RATE_LIMIT_REASONS = ("rateLimitExceeded", "userRateLimitExceeded")
+
+
+def http_status(error: Exception) -> Optional[int]:
+    """HTTP status of a googleapiclient HttpError, else None."""
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "resp", None), "status", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_not_found(error: Exception) -> bool:
+    """The file does not exist, or is not visible to this account."""
+    return isinstance(error, FileNotFoundError) or http_status(error) == 404
+
+
+def is_transient(error: Exception) -> bool:
+    """A retry later may succeed: network failure, rate limit or server error."""
+    if isinstance(error, (ConnectionError, TimeoutError, ssl.SSLError, httplib2.HttpLib2Error)):
+        return True
+    if isinstance(error, OSError) and error.errno in _NETWORK_ERRNOS:
+        return True
+    status = http_status(error)
+    if status == 429 or (status is not None and status >= 500):
+        return True
+    return status == 403 and any(r in str(error) for r in _RATE_LIMIT_REASONS)
+
+
+# ─── Bandwidth limiting ──────────────────────────────────────────────────
+
+THROTTLED_CHUNK_SIZE = 256 * 1024  # small chunks so the pacing is smooth
+
+
+class Throttle:
+    """Paces a transfer to `limit_kib` KiB/s, given the cumulative bytes moved."""
+
+    def __init__(self, limit_kib: int, clock=time.monotonic, sleep=time.sleep):
+        self._rate = limit_kib * 1024
+        self._clock = clock
+        self._sleep = sleep
+        self._start = clock()
+
+    def wait(self, bytes_done: int):
+        ahead = bytes_done / self._rate - (self._clock() - self._start)
+        if ahead > 0:
+            self._sleep(ahead)
 
 
 class DriveAPI:
@@ -433,9 +492,10 @@ class DriveAPI:
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build the request object under the lock (service/credentials are shared state),
-        # then stream the actual bytes outside the lock so a large download doesn't block
-        # the remote-watcher poll thread for minutes.
+        # The whole download holds the lock: httplib2 is not thread-safe, and the
+        # request streams over the service's shared connection.
+        limited = self.bandwidth_limit_kib > 0
+        temp_path = dest_path.with_suffix(dest_path.suffix + ".partial~")
         with self._api_lock:
             if mime_type in GOOGLE_NATIVE_MIMES:
                 export_mime, _ = GOOGLE_EXPORT_MAP[mime_type]
@@ -445,61 +505,59 @@ class DriveAPI:
             else:
                 request = self.service.files().get_media(fileId=file_id)
 
-        # Download to a temp file first, then rename on success
-        # This prevents leaving 0-byte files when download fails
-        temp_path = dest_path.with_suffix(dest_path.suffix + ".partial~")
-        try:
-            with open(temp_path, "wb") as f:
-                downloader = MediaIoBaseDownload(f, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                    # Apply bandwidth throttling
-                    if self.bandwidth_limit_kib > 0 and status:
-                        # Estimate sleep time based on bytes downloaded
-                        bytes_downloaded = status.resumable_progress
-                        target_time = bytes_downloaded / (self.bandwidth_limit_kib * 1024)
-                        # Sleep to throttle (rough approximation)
-                        import time
-                        elapsed = time.time() - getattr(self, '_download_start', time.time())
-                        if elapsed < target_time:
-                            time.sleep(min(target_time - elapsed, 1.0))
-            # Success — rename to final destination
-            temp_path.rename(dest_path)
-        except Exception:
-            # Clean up partial file on failure
-            temp_path.unlink(missing_ok=True)
-            raise
+            # Download to a temp file and rename on success, so a failure never
+            # leaves a truncated file behind.
+            try:
+                with open(temp_path, "wb") as f:
+                    if limited:
+                        downloader = MediaIoBaseDownload(f, request, chunksize=THROTTLED_CHUNK_SIZE)
+                        throttle = Throttle(self.bandwidth_limit_kib)
+                    else:
+                        downloader = MediaIoBaseDownload(f, request)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                        if limited and status:
+                            throttle.wait(status.resumable_progress)
+                temp_path.rename(dest_path)
+            except Exception:
+                temp_path.unlink(missing_ok=True)
+                raise
 
         log.debug("Downloaded: %s", dest_path)
 
     def upload_file(self, local_path: Path, parent_id: str, file_id: Optional[str] = None) -> dict:
         """Upload or update a file on Drive."""
         mime_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
-        media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
+        limited = self.bandwidth_limit_kib > 0
+        if limited:
+            media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True,
+                                    chunksize=THROTTLED_CHUNK_SIZE)
+        else:
+            media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
 
         metadata = {"name": local_path.name}
 
         with self._api_lock:
+            files = self.service.files()
             if file_id:
-                # Update existing file
-                result = (
-                    self.service.files()
-                    .update(fileId=file_id, media_body=media,
-                            fields="id,md5Checksum,modifiedTime",
-                            supportsAllDrives=True)
-                    .execute()
-                )
+                request = files.update(fileId=file_id, media_body=media,
+                                       fields="id,md5Checksum,modifiedTime",
+                                       supportsAllDrives=True)
             else:
-                # Create new file
                 metadata["parents"] = [parent_id]
-                result = (
-                    self.service.files()
-                    .create(body=metadata, media_body=media,
-                            fields="id,md5Checksum,modifiedTime",
-                            supportsAllDrives=True)
-                    .execute()
-                )
+                request = files.create(body=metadata, media_body=media,
+                                       fields="id,md5Checksum,modifiedTime",
+                                       supportsAllDrives=True)
+            if limited:
+                throttle = Throttle(self.bandwidth_limit_kib)
+                result = None
+                while result is None:
+                    status, result = request.next_chunk()
+                    if status:
+                        throttle.wait(status.resumable_progress)
+            else:
+                result = request.execute()
 
         log.debug("Uploaded: %s -> %s", local_path.name, result["id"])
         return result

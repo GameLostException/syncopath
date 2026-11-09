@@ -26,6 +26,10 @@ from .sync_worker import SyncWorker
 
 log = logging.getLogger("syncopath")
 
+# Delay before each new attempt after a failed initial sync (last value repeats)
+_INITIAL_SYNC_BACKOFF = [30, 60, 120, 300]
+_RECONCILE_INTERVAL = 600  # seconds
+
 
 def _format_size(size_bytes: int) -> str:
     """Format bytes to human-readable size."""
@@ -49,6 +53,7 @@ class SyncoPathDaemon:
         self.accounts: list[dict] = []
         self.tray = TrayIcon(icon_theme=config.icon_theme)
         self._running = False
+        self._stop = threading.Event()  # set on quit; wakes every wait below
         self._overlays: list[ThunarOverlay] = []
         self._workers: list[SyncWorker] = []
 
@@ -122,91 +127,97 @@ class SyncoPathDaemon:
         Gtk.main()
 
     def _start_sync(self):
-        """Start all watchers and perform initial sync if needed."""
-        for acc in self.accounts:
-            engine = acc["engine"]
-            state_db = acc["state_db"]
-            local_watcher = acc["local_watcher"]
-            remote_watcher = acc["remote_watcher"]
-            acc_name = acc["config"].name
+        """Start every account in parallel; returns once all are running."""
+        threads = [threading.Thread(target=self._start_account, args=(acc,), daemon=True,
+                                    name=f"start-{acc['config'].name}")
+                   for acc in self.accounts]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if self._running:
+            self.tray.update_status("idle", "All accounts synced")
 
-            # Show startup activity immediately
-            self.tray.update_status("working", f"Starting {acc_name}...")
+    def _start_account(self, acc: dict):
+        """Catch up with what changed while stopped, then start the watchers."""
+        engine = acc["engine"]
+        state_db = acc["state_db"]
+        local_watcher = acc["local_watcher"]
+        remote_watcher = acc["remote_watcher"]
+        acc_name = acc["config"].name
 
-            # Immediately mark files with their current status (synced or unknown)
-            overlay_idx = next(
-                (i for i, o in enumerate(self._overlays)
-                 if o.account_name == acc_name), None
-            )
-            if overlay_idx is not None:
-                self.tray.update_status("working", f"Restoring file emblems...")
-                # Run synchronously — no concurrent threads during startup
-                self._overlays[overlay_idx].mark_unknown_files(state_db)
+        self.tray.update_status("working", f"Starting {acc_name}...")
+        for overlay in self._overlays:
+            if overlay.account_name == acc_name:
+                self.tray.update_status("working", "Restoring file emblems...")
+                overlay.mark_unknown_files(state_db)
 
-            # Check if initial sync is needed
-            if state_db.get_page_token() is None:
-                log.info("First run for %s — performing initial sync", acc_name)
-                self.tray.update_status("syncing", f"Initial sync for {acc_name}...")
-                try:
-                    engine.initial_sync()
-                except Exception as e:
-                    log.error("Initial sync failed for %s: %s", acc_name, e)
-                    self.tray.update_status("error", f"Initial sync failed: {e}")
-                    continue
-            else:
-                # Not first run — re-index folders to catch any created while offline
-                self.tray.update_status("working", f"Indexing folders...")
-                try:
-                    engine._index_remote_folders()
-                except Exception as e:
-                    log.warning("Folder index failed for %s: %s", acc_name, e)
+        # The worker exists from the start but is paused: local events seen during
+        # the startup scans wait in its queue instead of racing with the scans.
+        worker = SyncWorker()
+        worker.set_handlers(
+            on_local_changes=engine.handle_local_changes,
+            on_remote_changes=engine.handle_remote_changes,
+            on_reconcile=engine.reconcile,
+            on_folder_index=engine._index_remote_folders,
+        )
+        worker.pause()
+        worker.start()
+        self._workers.append(worker)
+        acc["worker"] = worker
 
-                # Scan for local files added while service was offline
-                self.tray.update_status("working", f"Scanning local files...")
-                try:
-                    engine.scan_local_untracked()
-                except Exception as e:
-                    log.warning("Local scan failed for %s: %s", acc_name, e)
-
-                # Scan for remote files not downloaded (created while service was offline)
-                self.tray.update_status("working", f"Checking for missing remote files...")
-                try:
-                    engine.scan_remote_undownloaded()
-                except Exception as e:
-                    log.warning("Remote scan failed for %s: %s", acc_name, e)
-
-            # Create sync worker for this account
-            self.tray.update_status("working", f"Starting watchers...")
-            worker = SyncWorker()
-            worker.set_handlers(
-                on_local_changes=engine.handle_local_changes,
-                on_remote_changes=engine.handle_remote_changes,
-                on_reconcile=engine.reconcile,
-                on_folder_index=engine._index_remote_folders,
-            )
-            worker.start()
-            self._workers.append(worker)
-            acc["worker"] = worker
-
-            # Start watchers — they enqueue into the worker
+        first_run = state_db.get_page_token() is None
+        if first_run:
+            log.info("First run for %s — performing initial sync", acc_name)
+            if not self._initial_sync_with_retry(acc):
+                return
             local_watcher.start(worker.enqueue_local)
-            remote_watcher.start(worker.enqueue_remote)
+        else:
+            local_watcher.start(worker.enqueue_local)
+            for label, step in (("Indexing folders...", engine._index_remote_folders),
+                                ("Scanning local files...", engine.scan_local_untracked),
+                                ("Checking for missing remote files...",
+                                 engine.scan_remote_undownloaded)):
+                self.tray.update_status("working", label)
+                try:
+                    step()
+                except Exception as e:
+                    log.warning("%s failed for %s: %s", label, acc_name, e)
 
-            # Schedule initial reconcile (catches error/stale files from previous run)
-            worker.enqueue_reconcile()
+        remote_watcher.start(worker.enqueue_remote)
+        worker.enqueue_reconcile()  # catches error/stale files from the previous run
+        worker.resume()
 
-            # Schedule periodic reconcile every 10 minutes
-            def _periodic_reconcile(w=worker):
-                while self._running:
-                    time.sleep(600)  # 10 minutes
-                    if self._running:
-                        w.enqueue_reconcile()
-            threading.Thread(target=_periodic_reconcile, daemon=True,
-                           name="periodic-reconcile").start()
+        def _periodic_reconcile():
+            while not self._stop.wait(_RECONCILE_INTERVAL):
+                worker.enqueue_reconcile()
+        threading.Thread(target=_periodic_reconcile, daemon=True,
+                         name="periodic-reconcile").start()
 
-            log.info("Account '%s' syncing: %s", acc_name, acc["config"].local_path)
+        log.info("Account '%s' syncing: %s", acc_name, acc["config"].local_path)
 
-        self.tray.update_status("idle", "All accounts synced")
+    def _initial_sync_with_retry(self, acc: dict) -> bool:
+        """Run the initial sync until it succeeds. False if it cannot or we quit."""
+        acc_name = acc["config"].name
+        attempt = 0
+        while self._running:
+            self.tray.update_status("syncing", f"Initial sync for {acc_name}...")
+            try:
+                acc["engine"].initial_sync()
+                return True
+            except ValueError as e:  # configuration problem: retrying won't help
+                log.error("Initial sync refused for %s: %s", acc_name, e)
+                self.tray.update_status("error", f"{acc_name}: {e}")
+                return False
+            except Exception as e:
+                delay = _INITIAL_SYNC_BACKOFF[min(attempt, len(_INITIAL_SYNC_BACKOFF) - 1)]
+                attempt += 1
+                log.error("Initial sync failed for %s (attempt %d), retrying in %ds: %s",
+                          acc_name, attempt, delay, e)
+                self.tray.update_status("error", f"Initial sync failed, retrying in {delay}s")
+                if self._stop.wait(delay):
+                    return False
+        return False
 
     def _on_status_change(self, status: str, detail: str = ""):
         """Handle status change from any sync engine."""
@@ -228,14 +239,19 @@ class SyncoPathDaemon:
         for acc in self.accounts:
             acc["remote_watcher"].stop()
             acc["local_watcher"].stop()
+            if acc.get("worker"):
+                acc["worker"].pause()
         log.info("All sync paused")
 
     def _resume_all(self):
         """Resume all sync operations."""
         for acc in self.accounts:
             worker = acc.get("worker")
-            acc["local_watcher"].start(worker.enqueue_local if worker else None)
-            acc["remote_watcher"].start(worker.enqueue_remote if worker else None)
+            if not worker:
+                continue  # account never finished starting
+            acc["local_watcher"].start(worker.enqueue_local)
+            acc["remote_watcher"].start(worker.enqueue_remote)
+            worker.resume()
         log.info("All sync resumed")
 
     def _sync_now(self):
@@ -270,6 +286,7 @@ class SyncoPathDaemon:
         """Graceful shutdown."""
         log.info("Shutting down...")
         self._running = False
+        self._stop.set()
         for overlay in self._overlays:
             overlay.stop()
         for worker in self._workers:
@@ -290,7 +307,6 @@ def main():
     parser.add_argument("--auth", metavar="ACCOUNT", help="Authenticate an account")
     parser.add_argument("--prefs", action="store_true", help="Open preferences window")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--no-tray", action="store_true", help="Run without tray icon")
     parser.add_argument("--list-shared-drives", action="store_true",
                         help="List available shared drives")
     args = parser.parse_args()
@@ -306,8 +322,9 @@ def main():
     # When running manually (not under systemd), also write to a log file so
     # crashes can be investigated without relying on journald.
     # systemd sets JOURNAL_STREAM when it owns our stdout/stderr.
-    _log_dir = Path("/var/log/syncopath")
-    if "JOURNAL_STREAM" not in os.environ and _log_dir.is_dir() and os.access(_log_dir, os.W_OK):
+    _log_dir = Path.home() / ".local" / "state" / "syncopath"
+    if "JOURNAL_STREAM" not in os.environ:
+        _log_dir.mkdir(parents=True, exist_ok=True)
         _file_handler = logging.handlers.RotatingFileHandler(
             _log_dir / "syncopath.log",
             maxBytes=10 * 1024 * 1024,   # 10 MiB per file
@@ -362,7 +379,7 @@ def main():
                 print(f"{d['name']:<40} {d['id']:<25} {size_str:<12} {enabled}")
             print(f"\nTo sync a shared drive, add it to ~/.config/syncopath/config.yaml:")
             print(f"  - name: shared-<name>")
-            print(f"    local_path: /home/boris/shared-drives/<name>")
+            print(f"    local_path: ~/SyncoPath/<account>/<drive name>")
             print(f"    shared_drive_id: <ID>")
         return
 

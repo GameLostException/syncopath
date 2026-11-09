@@ -1,6 +1,8 @@
 """SQLite state database for tracking file sync state."""
+import functools
 import sqlite3
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,12 +26,22 @@ class FileState:
     sync_status: str = "unknown"  # synced, syncing, pending, error, unknown
 
 
+def _locked(method):
+    """Serialise access: one connection is shared by the worker, the poll thread and the UI."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class StateDB:
-    """SQLite-backed sync state tracker."""
+    """SQLite-backed sync state tracker. Safe to call from several threads."""
 
     def __init__(self, account_name: str):
         self.db_path = STATE_DIR / f"{account_name}.db"
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # WAL mode allows concurrent reads while worker thread writes
@@ -63,21 +75,29 @@ class StateDB:
             self._conn.execute("ALTER TABLE files ADD COLUMN sync_status TEXT DEFAULT 'unknown'")
         self._conn.commit()
 
-    def get_page_token(self) -> Optional[str]:
-        """Get stored Changes API page token."""
+    @_locked
+    def get_meta(self, key: str) -> Optional[str]:
         row = self._conn.execute(
-            "SELECT value FROM metadata WHERE key = 'page_token'"
+            "SELECT value FROM metadata WHERE key = ?", (key,)
         ).fetchone()
         return row["value"] if row else None
 
-    def set_page_token(self, token: str):
-        """Store Changes API page token."""
+    @_locked
+    def set_meta(self, key: str, value: str):
         self._conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('page_token', ?)",
-            (token,),
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value)
         )
         self._conn.commit()
 
+    def get_page_token(self) -> Optional[str]:
+        """Get stored Changes API page token."""
+        return self.get_meta("page_token")
+
+    def set_page_token(self, token: str):
+        """Store Changes API page token."""
+        self.set_meta("page_token", token)
+
+    @_locked
     def get_by_path(self, path: str) -> Optional[FileState]:
         """Look up file state by relative path."""
         row = self._conn.execute(
@@ -85,6 +105,7 @@ class StateDB:
         ).fetchone()
         return self._row_to_state(row) if row else None
 
+    @_locked
     def get_by_file_id(self, file_id: str) -> Optional[FileState]:
         """Look up file state by Drive file ID."""
         row = self._conn.execute(
@@ -92,11 +113,13 @@ class StateDB:
         ).fetchone()
         return self._row_to_state(row) if row else None
 
+    @_locked
     def get_all(self) -> list[FileState]:
         """Get all tracked files."""
         rows = self._conn.execute("SELECT * FROM files").fetchall()
         return [self._row_to_state(r) for r in rows]
 
+    @_locked
     def upsert(self, state: FileState):
         """Insert or update file state."""
         self._conn.execute(
@@ -117,16 +140,19 @@ class StateDB:
         )
         self._conn.commit()
 
+    @_locked
     def delete_by_path(self, path: str):
         """Remove a file from state tracking."""
         self._conn.execute("DELETE FROM files WHERE path = ?", (path,))
         self._conn.commit()
 
+    @_locked
     def delete_by_file_id(self, file_id: str):
         """Remove a file from state tracking by its Drive ID."""
         self._conn.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
         self._conn.commit()
 
+    @_locked
     def rename(self, old_path: str, new_path: str):
         """Update path after a rename/move."""
         self._conn.execute(
@@ -134,6 +160,7 @@ class StateDB:
         )
         self._conn.commit()
 
+    @_locked
     def rename_prefix(self, old_prefix: str, new_prefix: str):
         """Update all paths that start with old_prefix to use new_prefix.
 
@@ -154,6 +181,7 @@ class StateDB:
             log.debug("Renamed %d children from '%s/' to '%s/'",
                       len(rows), old_prefix, new_prefix)
 
+    @_locked
     def set_sync_status(self, path: str, status: str):
         """Update sync_status for a file."""
         self._conn.execute(
@@ -161,6 +189,7 @@ class StateDB:
         )
         self._conn.commit()
 
+    @_locked
     def get_all_paths_with_status(self) -> dict[str, str]:
         """Get a dict of {path: sync_status} for all tracked files."""
         rows = self._conn.execute(
@@ -168,12 +197,14 @@ class StateDB:
         ).fetchall()
         return {row["path"]: row["sync_status"] for row in rows}
 
+    @_locked
     def clear(self):
         """Clear all state (for resync)."""
         self._conn.execute("DELETE FROM files")
         self._conn.execute("DELETE FROM metadata")
         self._conn.commit()
 
+    @_locked
     def close(self):
         self._conn.close()
 

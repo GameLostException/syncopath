@@ -9,8 +9,6 @@ Covers:
 """
 import threading
 import time
-import sqlite3
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 import pytest
@@ -24,31 +22,9 @@ from syncopath.state import StateDB
 # ---------------------------------------------------------------------------
 
 def _make_state_db(tmp_path: Path) -> StateDB:
-    """Create a fresh in-memory StateDB for testing (bypasses file I/O)."""
-    db = StateDB.__new__(StateDB)
-    db._conn = sqlite3.connect(":memory:", check_same_thread=False)
-    db._conn.row_factory = sqlite3.Row
-    db._conn.execute("PRAGMA journal_mode=WAL")
-    db._conn.executescript("""
-        CREATE TABLE IF NOT EXISTS files (
-            path TEXT PRIMARY KEY,
-            file_id TEXT UNIQUE,
-            remote_md5 TEXT,
-            local_md5 TEXT,
-            remote_mtime TEXT,
-            local_mtime REAL,
-            mime_type TEXT,
-            is_folder INTEGER DEFAULT 0,
-            sync_status TEXT DEFAULT 'unknown'
-        );
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_file_id ON files(file_id);
-    """)
-    db._conn.commit()
-    return db
+    """A real StateDB in a temp directory (same schema as production)."""
+    with patch("syncopath.state.STATE_DIR", tmp_path / "state"):
+        return StateDB("test")
 
 
 def _make_drive_mock(changes=None, new_token="1"):
@@ -267,15 +243,16 @@ class TestFailureBackoff:
         watcher = RemoteWatcher(drive, db, poll_interval=30)
 
         sleep_durations = []
-        original_wait = threading.Event.wait
 
-        def capturing_wait(self_event, timeout=None):
+        def capturing_wait(timeout=None):
             if timeout is not None and timeout != 30:
                 sleep_durations.append(timeout)
             # Don't actually sleep in the test
             return False
 
-        with patch.object(threading.Event, "wait", capturing_wait):
+        # Patch only this watcher's wake event: patching threading.Event.wait for the
+        # whole process also breaks Thread.start() inside the watchdog (flaky test).
+        with patch.object(watcher._wake_event, "wait", capturing_wait):
             watcher.start(callback=lambda c: None)
             time.sleep(0.3)
             watcher.stop()
