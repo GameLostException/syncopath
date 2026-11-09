@@ -72,7 +72,7 @@ Python dependencies, pinned in `pyproject.toml`:
 ## Development
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e . pytest pytest-cov
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
 
 ```bash
@@ -84,6 +84,7 @@ python3 -m venv .venv && .venv/bin/pip install -e . pytest pytest-cov
 ```
 
 Tests use an in-memory Drive (`tests/mock_drive.py`) and never touch the network.
+CI runs the same suite on every pull request (`.github/workflows/tests.yml`, ADR-0004).
 Architecture and design decisions: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/decisions/](docs/decisions/).
 
