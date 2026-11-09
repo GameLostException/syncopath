@@ -222,6 +222,12 @@ class PreferencesWindow(Gtk.Window):
         self._account_notebook.set_no_show_all(False)
         self._account_notebook.show_all()
 
+    def _is_shown(self, account_name: Optional[str]) -> bool:
+        """Background work finishes after the user may have selected another account.
+        Its result is applied only if its account is still the one on screen."""
+        current = getattr(self, "_current_account", None) or {}
+        return account_name is None or current.get("name") == account_name
+
     def _rebuild_account_notebook(self, account_data: dict):
         """Rebuild the per-account notebook tabs for the selected account."""
         # Remove old pages
@@ -413,10 +419,8 @@ class PreferencesWindow(Gtk.Window):
 
     def _refresh_swm_stats(self, account_data: dict):
         """Fetch shared-with-me stats from Drive API in background."""
-        # The result goes to THIS account's widgets, even if the user has selected
-        # another account (and rebuilt the tab) by the time it arrives.
-        label, spinner = self._swm_stats_label, self._swm_stats_spinner
-        spinner.start()
+        self._swm_stats_spinner.start()
+        name = account_data["name"]
 
         def _fetch():
             try:
@@ -427,9 +431,9 @@ class PreferencesWindow(Gtk.Window):
                 stats = drive.get_shared_with_me_stats()
                 # Cache the result
                 self._cache_swm_stats(account_data["name"], stats)
-                GLib.idle_add(self._on_swm_stats_loaded, stats, None, label, spinner)
+                GLib.idle_add(self._on_swm_stats_loaded, stats, None, name)
             except Exception as e:
-                GLib.idle_add(self._on_swm_stats_loaded, None, str(e), label, spinner)
+                GLib.idle_add(self._on_swm_stats_loaded, None, str(e), name)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -447,22 +451,21 @@ class PreferencesWindow(Gtk.Window):
         except Exception as e:
             log.warning("Failed to cache swm stats: %s", e)
 
-    def _on_swm_stats_loaded(self, stats: dict, error: str, label=None, spinner=None):
-        """Update UI with shared-with-me stats (main thread).
-
-        label/spinner: the widgets of the account that requested the stats.
-        """
-        label = label or self._swm_stats_label
-        (spinner or self._swm_stats_spinner).stop()
+    def _on_swm_stats_loaded(self, stats: dict, error: str, account_name: str = None):
+        """Update UI with shared-with-me stats (main thread)."""
+        if not self._is_shown(account_name):
+            return False
+        self._swm_stats_spinner.stop()
 
         if error:
-            label.set_markup(f"<small><i>⚠ {GLib.markup_escape_text(str(error))}</i></small>")
+            self._swm_stats_label.set_markup(
+                f"<small><i>⚠ {GLib.markup_escape_text(str(error))}</i></small>")
             return False
 
-        self._update_swm_stats_label(stats, label)
+        self._update_swm_stats_label(stats)
         return False
 
-    def _update_swm_stats_label(self, stats: dict, label=None):
+    def _update_swm_stats_label(self, stats: dict):
         """Format and display shared-with-me stats."""
         file_count = stats.get("file_count", 0)
         total_size = stats.get("total_size", 0)
@@ -477,7 +480,7 @@ class PreferencesWindow(Gtk.Window):
         else:
             size_str = f"{total_size} bytes"
 
-        (label or self._swm_stats_label).set_markup(
+        self._swm_stats_label.set_markup(
             f"<small>{file_count:,} files · {size_str}</small>")
 
     def _on_save_account_general(self, account_data: dict):
@@ -665,6 +668,8 @@ class PreferencesWindow(Gtk.Window):
     def _on_shared_drives_loaded(self, drives: list, error: Optional[str],
                                   account_data: dict):
         """Populate shared drives list (main thread)."""
+        if not self._is_shown(account_data["name"]):
+            return False
         self._shared_drives_spinner.stop()
 
         for child in self._shared_drives_box.get_children():
@@ -708,15 +713,20 @@ class PreferencesWindow(Gtk.Window):
                 acc = next(a for a in config.accounts if a.name == account_data["name"])
                 drive = DriveAPI(acc.name, acc.client_id, acc.client_secret)
                 usage = drive.get_shared_drive_usage(drive_id)
-                GLib.idle_add(self._on_drive_size_ready, drive_id, usage, None)
+                GLib.idle_add(self._on_drive_size_ready, drive_id, usage, None,
+                              account_data["name"])
             except Exception as e:
-                GLib.idle_add(self._on_drive_size_ready, drive_id, 0, str(e))
+                GLib.idle_add(self._on_drive_size_ready, drive_id, 0, str(e),
+                              account_data["name"])
 
         for drive_id in drive_ids:
             threading.Thread(target=_fetch_one, args=(drive_id,), daemon=True).start()
 
-    def _on_drive_size_ready(self, drive_id: str, usage_bytes: int, error: Optional[str]):
+    def _on_drive_size_ready(self, drive_id: str, usage_bytes: int, error: Optional[str],
+                             account_name: str = None):
         """Update size label for a shared drive."""
+        if not self._is_shown(account_name):
+            return False
         label = self._shared_drive_size_labels.get(drive_id)
         if not label:
             return False
@@ -1403,6 +1413,8 @@ class PreferencesWindow(Gtk.Window):
 
     def _on_issues_loaded(self, issues: list, error: str, account_data: dict):
         """Populate issues list (main thread)."""
+        if not self._is_shown(account_data["name"]):
+            return False
         self._issues_spinner.stop()
 
         if error:
