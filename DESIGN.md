@@ -101,7 +101,7 @@ accounts:
 ## File Structure
 
 ```
-~/Lab/syncopath/
+syncopath/
 ├── DESIGN.md
 ├── pyproject.toml
 ├── syncopath/
@@ -113,8 +113,10 @@ accounts:
 │   ├── local_watcher.py     # inotify/watchdog watcher
 │   ├── sync_engine.py       # Core sync logic
 │   ├── drive_api.py         # Google Drive API wrapper
+│   ├── sync_worker.py       # Event queue, single worker thread, retries
 │   ├── tray.py              # GTK tray icon
-│   └── conflicts.py         # Conflict resolution
+│   ├── thunar_overlay.py    # Thunar emblems (libcloudproviders D-Bus + GIO)
+│   └── preferences.py       # GTK preferences window
 ├── systemd/
 │   └── syncopath.service
 └── install.sh               # Sets up venv, credentials, systemd
