@@ -132,6 +132,15 @@ def is_transient(error: Exception) -> bool:
     return status == 403 and bool(_error_reasons(error) & set(_RATE_LIMIT_REASONS))
 
 
+def stored_email(account_name: str) -> Optional[str]:
+    """The Google account email recorded at sign-in, if known."""
+    token_path = TOKENS_DIR / f"{account_name}.json"
+    try:
+        return json.loads(token_path.read_text()).get("email")
+    except (OSError, ValueError):
+        return None
+
+
 # ─── Bandwidth limiting ──────────────────────────────────────────────────
 
 THROTTLED_CHUNK_SIZE = 256 * 1024  # small chunks so the pacing is smooth
@@ -196,13 +205,28 @@ class DriveAPI:
         return self._creds
 
     def _save_credentials(self):
-        """Persist credentials to disk."""
+        """Persist credentials to disk (keeping the recorded email)."""
         TOKENS_DIR.mkdir(parents=True, exist_ok=True)
         data = {
             "access_token": self._creds.token,
             "refresh_token": self._creds.refresh_token,
             "token_type": "Bearer",
         }
+        email = stored_email(self.account_name)
+        if email:
+            data["email"] = email
+        self._token_path.write_text(json.dumps(data))
+
+    def get_account_email(self) -> str:
+        """Email of the Google account these credentials belong to."""
+        with self._api_lock:
+            about = self.service.about().get(fields="user(emailAddress)").execute()
+        return about["user"]["emailAddress"]
+
+    def remember_email(self, email: str):
+        """Record the account's email next to its token (shown in Preferences)."""
+        data = json.loads(self._token_path.read_text())
+        data["email"] = email
         self._token_path.write_text(json.dumps(data))
 
     @property
@@ -304,6 +328,10 @@ class DriveAPI:
             client_secret=client_secret,
         )
         self._save_credentials()
+        try:
+            self.remember_email(self.get_account_email())
+        except Exception as e:  # Preferences looks it up later
+            log.warning("Could not read the account email for %s: %s", self.account_name, e)
         log.info("Authenticated account: %s", self.account_name)
 
     def get_start_page_token(self) -> str:

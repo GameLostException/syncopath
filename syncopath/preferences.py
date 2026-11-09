@@ -12,6 +12,7 @@ from gi.repository import Gtk, GLib, Gdk, Pango
 
 import yaml
 
+from .drive_api import stored_email
 from .trash import move_to_trash
 
 from .config import (
@@ -56,12 +57,12 @@ class AccountRow(Gtk.ListBoxRow):
             icon.set_tooltip_text("Not authenticated")
         hbox.pack_start(icon, False, False, 0)
 
-        # Account info
+        # Account info: the Google account's email (the config name until it is known)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
-        name_label = Gtk.Label()
-        name_label.set_markup(f"<b>{GLib.markup_escape_text(account_data['name'])}</b>")
-        name_label.set_xalign(0)
-        vbox.pack_start(name_label, False, False, 0)
+        self._title_label = Gtk.Label()
+        self._title_label.set_xalign(0)
+        self.show_email(stored_email(account_data["name"]) or account_data["name"])
+        vbox.pack_start(self._title_label, False, False, 0)
 
         path_label = Gtk.Label(label=account_data.get("local_path", ""))
         path_label.set_xalign(0)
@@ -72,6 +73,9 @@ class AccountRow(Gtk.ListBoxRow):
 
         hbox.pack_start(vbox, True, True, 0)
         self.add(hbox)
+
+    def show_email(self, email: str):
+        self._title_label.set_markup(f"<b>{GLib.markup_escape_text(email)}</b>")
 
 
 # ─── Main Preferences Window ───────────────────────────────────────────────
@@ -269,13 +273,23 @@ class PreferencesWindow(Gtk.Window):
         token_path = TOKENS_DIR / f"{acc_name}.json"
         is_authenticated = token_path.exists()
 
-        # Account name
+        # Account: the Google email; the config name is shown separately
         name_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         name_box.pack_start(Gtk.Label(label="Account:"), False, False, 0)
         name_label = Gtk.Label()
-        name_label.set_markup(f"<b>{GLib.markup_escape_text(acc_name)}</b>")
+        email = stored_email(acc_name)
+        name_label.set_markup(
+            f"<b>{GLib.markup_escape_text(email or 'not signed in yet')}</b>")
         name_box.pack_start(name_label, False, False, 0)
         vbox.pack_start(name_box, False, False, 0)
+
+        config_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        config_box.pack_start(Gtk.Label(label="Config name:"), False, False, 0)
+        config_label = Gtk.Label(label=acc_name)
+        config_label.set_selectable(True)
+        config_label.set_opacity(0.7)
+        config_box.pack_start(config_label, False, False, 0)
+        vbox.pack_start(config_box, False, False, 0)
 
         # Local path
         path_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1748,6 +1762,27 @@ class PreferencesWindow(Gtk.Window):
                 self._accounts_listbox.add(row)
 
         self._accounts_listbox.show_all()
+        self._fill_missing_emails()
+
+    def _fill_missing_emails(self):
+        """Look up, once, the email of signed-in accounts that predate its recording."""
+        for row in self._accounts_listbox.get_children():
+            name = getattr(row, "data", {}).get("name")
+            if not name or not (TOKENS_DIR / f"{name}.json").exists() or stored_email(name):
+                continue
+
+            def _fetch(row=row, name=name):
+                try:
+                    from .drive_api import DriveAPI
+                    acc = next(a for a in AppConfig.load().accounts if a.name == name)
+                    api = DriveAPI(acc.name, acc.client_id, acc.client_secret)
+                    email = api.get_account_email()
+                    api.remember_email(email)
+                    GLib.idle_add(row.show_email, email)
+                except Exception as e:
+                    log.warning("Could not look up the email of %s: %s", name, e)
+
+            threading.Thread(target=_fetch, daemon=True).start()
 
     def _on_add_account(self, _btn):
         """Add a new account via dialog."""
