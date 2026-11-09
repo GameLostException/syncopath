@@ -1,6 +1,6 @@
 # SyncoPath — Technical Documentation
 
-**Version**: 0.1.2
+**Version**: 0.2.0
 **Last updated**: 2026-11-09
 
 ---
